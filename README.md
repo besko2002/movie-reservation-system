@@ -1,5 +1,7 @@
 # Movie Reservation System — REST API
 
+[![CI](https://github.com/besko2002/movie-reservation-system/actions/workflows/ci.yml/badge.svg)](https://github.com/besko2002/movie-reservation-system/actions/workflows/ci.yml)
+
 A cinema booking backend: browse movies and showtimes, hold seats for a few minutes, pay through
 Stripe Checkout, and cancel with a full refund before the show. API only — no frontend; explore it
 with Swagger UI at <http://localhost:8080/swagger-ui.html>.
