@@ -1,0 +1,85 @@
+spring:
+  application:
+    name: movie-reservation-system
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5434/movie_reservation}
+    username: ${DB_USERNAME:movie}
+    password: ${DB_PASSWORD:movie}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+
+app:
+  jwt:
+    # Dev-only default; always override JWT_SECRET outside local development.
+    # HS256 needs at least 32 bytes - the application fails to start with a shorter secret.
+    secret: ${JWT_SECRET:dev-only-insecure-secret-change-me-movie-reservation-system-0123456789}
+    expiration: ${JWT_EXPIRATION:3600000}
+  schedule:
+    # Cleaning time appended after the movie duration. It is part of the stored end_time, so the
+    # "no overlapping schedules in the same theater" rule already keeps the hall free for it.
+    buffer-minutes: ${SCHEDULE_BUFFER_MINUTES:15}
+    # Business time zone used to interpret GET /api/schedules?date=yyyy-MM-dd. Timestamps
+    # themselves are always stored and returned as absolute instants (TIMESTAMPTZ).
+    zone: ${SCHEDULE_ZONE:UTC}
+  reservation:
+    # How long a seat hold stays valid. The seat is free again afterwards, lazily (the seat map
+    # reports AVAILABLE at once) and eagerly (the sweeper below flips the row to RELEASED).
+    hold-minutes: ${RESERVATION_HOLD_MINUTES:10}
+    # Upper bound per hold request, so one client cannot lock a whole hall.
+    max-seats: ${RESERVATION_MAX_SEATS:10}
+    # Interval of the expiry sweeper, in milliseconds.
+    sweep-ms: ${RESERVATION_SWEEP_MS:60000}
+  # Absolute base URL of this API, used to build the Stripe Checkout success/cancel return URLs.
+  base-url: ${APP_BASE_URL:http://localhost:8080}
+  stripe:
+    # Empty by default on purpose: the application must start without Stripe credentials. While the
+    # key is blank, PaymentGatewayConfig publishes DisabledPaymentGateway and every endpoint that
+    # needs Stripe answers 503 Service Unavailable with an ApiError (never a 500).
+    secret-key: ${STRIPE_SECRET_KEY:}
+    # Shared secret of the webhook endpoint; the raw request body is HMAC-SHA256 verified with it.
+    webhook-secret: ${STRIPE_WEBHOOK_SECRET:}
+    # ISO 4217 currency every Checkout Session and refund is created in.
+    currency: ${STRIPE_CURRENCY:usd}
+  ticket:
+    # A PAID ticket may only be cancelled (and fully refunded) until this many hours before the
+    # showtime starts; afterwards DELETE /api/tickets/{id} answers 409.
+    cancellation-cutoff-hours: ${TICKET_CANCELLATION_CUTOFF_HOURS:2}
+    # How long a buyer has to pay a checkout. It is both the Checkout Session's expires_at and the
+    # new expiry of the seat holds the ticket was opened for, so the seats can never be swept away
+    # while the payment page is still payable. Stripe only accepts 30..1440 minutes and the
+    # application refuses to start with a value outside that range.
+    checkout-minutes: ${TICKET_CHECKOUT_MINUTES:30}
+  admin:
+    email: ${ADMIN_EMAIL:admin@cinema.local}
+    password: ${ADMIN_PASSWORD:Admin@12345}
+    name: ${ADMIN_NAME:System Admin}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    org.flywaydb: info
