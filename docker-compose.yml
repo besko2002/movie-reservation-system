@@ -1,0 +1,73 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: movie-reservation-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: movie_reservation
+      POSTGRES_USER: movie
+      POSTGRES_PASSWORD: movie
+    ports:
+      # Host 5434 -> container 5432.
+      # A local (Homebrew) PostgreSQL 16 already listens on 127.0.0.1:5433, and a specific
+      # loopback bind wins over Docker's wildcard bind, so mapping 5433 would silently route
+      # clients to that local server. 5432 is left free for the conventional local default.
+      - "5434:5432"
+    volumes:
+      - movie_reservation_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U movie -d movie_reservation"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # The API itself, behind the "app" profile: `docker compose up -d` keeps starting only
+  # Postgres (every earlier phase runs the app from the IDE / ./mvnw against it), while
+  # `docker compose --profile app up -d --build` runs the whole stack in Docker.
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: movie-reservation-system:local
+    container_name: movie-reservation-app
+    profiles: ["app"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Optional: values from a local .env override the defaults below. The file may be absent.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Container-network address of the database service: port 5432 inside the compose
+      # network, NOT the 5434 host mapping. Set here (not via .env) on purpose, because
+      # a .env written for local runs points DB_URL at localhost:5434.
+      DB_URL: jdbc:postgresql://postgres:5432/movie_reservation
+      DB_USERNAME: ${DB_USERNAME:-movie}
+      DB_PASSWORD: ${DB_PASSWORD:-movie}
+      # Dev-only fallback secret (>= 32 bytes, as HS256 requires). Override it outside development.
+      JWT_SECRET: ${JWT_SECRET:-dev-only-insecure-secret-change-me-movie-reservation-system-0123456789}
+      JWT_EXPIRATION: ${JWT_EXPIRATION:-3600000}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@cinema.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin@12345}
+      ADMIN_NAME: ${ADMIN_NAME:-System Admin}
+      # Empty by default: without a Stripe key the checkout endpoints answer 503 and the
+      # rest of the API keeps working.
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_CURRENCY: ${STRIPE_CURRENCY:-usd}
+      TICKET_CANCELLATION_CUTOFF_HOURS: ${TICKET_CANCELLATION_CUTOFF_HOURS:-2}
+      TICKET_CHECKOUT_MINUTES: ${TICKET_CHECKOUT_MINUTES:-30}
+      SCHEDULE_BUFFER_MINUTES: ${SCHEDULE_BUFFER_MINUTES:-15}
+      SCHEDULE_ZONE: ${SCHEDULE_ZONE:-UTC}
+      RESERVATION_HOLD_MINUTES: ${RESERVATION_HOLD_MINUTES:-10}
+      RESERVATION_MAX_SEATS: ${RESERVATION_MAX_SEATS:-10}
+      RESERVATION_SWEEP_MS: ${RESERVATION_SWEEP_MS:-60000}
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8080}
+    ports:
+      - "8080:8080"
+
+volumes:
+  movie_reservation_pgdata:
