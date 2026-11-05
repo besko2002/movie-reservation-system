@@ -46,6 +46,9 @@ class AuthAndSecurityIntegrationTest {
     private UserRepository userRepository;
 
     @Autowired
+    private javax.sql.DataSource dataSource;
+
+    @Autowired
     private AdminSeeder adminSeeder;
 
     @Value("${app.admin.email}")
@@ -207,6 +210,39 @@ class AuthAndSecurityIntegrationTest {
         assertThat(messageOf(unknownEmailBody)).isEqualTo(messageOf(wrongPasswordBody));
     }
 
+    @Test
+    void repeatedFailedLoginIsRateLimitedPerAddressAndAccount() throws Exception {
+        String email = uniqueEmail();
+        register(email);
+        String ip = "192.0.2.42";
+        for (int attempt = 0; attempt < 5; attempt++) {
+            mockMvc.perform(post("/api/auth/login")
+                            .with(request -> { request.setRemoteAddr(ip); return request; })
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(loginBody(email, "WrongPassword1!")))
+                    .andExpect(status().isUnauthorized());
+        }
+        mockMvc.perform(post("/api/auth/login")
+                        .with(request -> { request.setRemoteAddr(ip); return request; })
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(loginBody(email, PASSWORD)))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(jsonPath("$.status").value(429));
+        mockMvc.perform(post("/api/auth/login")
+                        .with(request -> { request.setRemoteAddr("192.0.2.43"); return request; })
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(loginBody(email, PASSWORD)))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void paymentReturnPagesArePublicAndRevealNoTicketDetails() throws Exception {
+        mockMvc.perform(get("/payment/success")).andExpect(status().isOk())
+                .andExpect(content().string(containsString("Payment submitted")));
+        mockMvc.perform(get("/payment/cancel")).andExpect(status().isOk())
+                .andExpect(content().string(containsString("Payment cancelled")));
+    }
+
     // --- /api/users/me -------------------------------------------------------------------
 
     @Test
@@ -234,6 +270,45 @@ class AuthAndSecurityIntegrationTest {
                 .andExpect(jsonPath("$.role").value("USER"))
                 .andExpect(jsonPath("$.passwordHash").doesNotExist())
                 .andExpect(content().string(not(containsString("$2a$"))));
+    }
+
+    @Test
+    void logoutRevokesTheOldTokenAndFreshLoginWorks() throws Exception {
+        String email = uniqueEmail();
+        String oldToken = register(email);
+
+        mockMvc.perform(post("/api/auth/logout").header("Authorization", "Bearer " + oldToken))
+                .andExpect(status().isNoContent());
+        mockMvc.perform(get("/api/users/me").header("Authorization", "Bearer " + oldToken))
+                .andExpect(status().isUnauthorized());
+        String newToken = login(email, PASSWORD);
+        mockMvc.perform(get("/api/users/me").header("Authorization", "Bearer " + newToken))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void roleChangeAndDisabledAccountInvalidateIssuedTokens() throws Exception {
+        String email = uniqueEmail();
+        String oldToken = register(email);
+        User user = userRepository.findByEmail(email).orElseThrow();
+
+        userRepository.saveAndFlush(changeRole(user, Role.ADMIN));
+        mockMvc.perform(get("/api/users/me").header("Authorization", "Bearer " + oldToken))
+                .andExpect(status().isUnauthorized());
+
+        String adminToken = login(email, PASSWORD);
+        mockMvc.perform(get("/api/admin/test-ping").header("Authorization", "Bearer " + adminToken))
+                .andExpect(status().isOk());
+        // Account state changes made by an operator take effect without waiting for token expiry.
+        org.springframework.jdbc.core.JdbcTemplate jdbc = new org.springframework.jdbc.core.JdbcTemplate(dataSource);
+        jdbc.update("update users set enabled = false where id = ?", user.getId());
+        mockMvc.perform(get("/api/admin/test-ping").header("Authorization", "Bearer " + adminToken))
+                .andExpect(status().isUnauthorized());
+    }
+
+    private static User changeRole(User user, Role role) {
+        user.setRole(role);
+        return user;
     }
 
     @Test

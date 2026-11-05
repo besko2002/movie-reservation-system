@@ -1,5 +1,6 @@
 package com.example.moviereservation.security;
 
+import com.example.moviereservation.users.TokenAccountValidator;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
@@ -26,7 +27,10 @@ public class SecurityConfig {
     };
 
     private static final String[] PUBLIC_PATHS = {
-            "/api/auth/**",
+            "/api/auth/login",
+            "/api/auth/register",
+            "/payment/success",
+            "/payment/cancel",
             "/actuator/health",
             "/actuator/health/**",
             "/v3/api-docs",
@@ -36,13 +40,16 @@ public class SecurityConfig {
     };
 
     private final JwtService jwtService;
+    private final TokenAccountValidator accountValidator;
     private final RestAuthenticationEntryPoint authenticationEntryPoint;
     private final RestAccessDeniedHandler accessDeniedHandler;
 
     public SecurityConfig(JwtService jwtService,
+                          TokenAccountValidator accountValidator,
                           RestAuthenticationEntryPoint authenticationEntryPoint,
                           RestAccessDeniedHandler accessDeniedHandler) {
         this.jwtService = jwtService;
+        this.accountValidator = accountValidator;
         this.authenticationEntryPoint = authenticationEntryPoint;
         this.accessDeniedHandler = accessDeniedHandler;
     }
@@ -66,7 +73,8 @@ public class SecurityConfig {
                 .exceptionHandling(handling -> handling
                         .authenticationEntryPoint(authenticationEntryPoint)
                         .accessDeniedHandler(accessDeniedHandler))
-                .addFilterBefore(new JwtAuthenticationFilter(jwtService), UsernamePasswordAuthenticationFilter.class);
+                .addFilterBefore(new JwtAuthenticationFilter(jwtService, accountValidator),
+                        UsernamePasswordAuthenticationFilter.class);
         return http.build();
     }
 

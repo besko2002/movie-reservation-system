@@ -37,6 +37,8 @@ interface SeatReservationRepository extends JpaRepository<SeatReservation, Long>
     /** Reservations that belong to one ticket (phase 7). */
     List<SeatReservation> findByTicketIdOrderByIdAsc(Long ticketId);
 
+    List<SeatReservation> findByTicketIdInOrderByIdAsc(Collection<Long> ticketIds);
+
     /** Non-released rows on any of these seats, across all schedules (seat regeneration seam). */
     List<SeatReservation> findBySeatIdInAndStatusIn(
             Collection<Long> seatIds, Collection<ReservationStatus> statuses);

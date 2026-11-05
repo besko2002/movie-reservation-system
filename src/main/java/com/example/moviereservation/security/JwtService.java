@@ -30,6 +30,7 @@ public class JwtService {
 
     private static final String CLAIM_EMAIL = "email";
     private static final String CLAIM_ROLE = "role";
+    private static final String CLAIM_TOKEN_VERSION = "ver";
 
     private final SecretKey signingKey;
     private final long expirationMillis;
@@ -52,12 +53,17 @@ public class JwtService {
 
     /** Signs a token for the given user. */
     public String generateToken(Long userId, String email, String role) {
+        return generateToken(userId, email, role, 0);
+    }
+
+    public String generateToken(Long userId, String email, String role, int tokenVersion) {
         Instant issuedAt = Instant.now();
         Instant expiresAt = issuedAt.plusMillis(expirationMillis);
         return Jwts.builder()
                 .subject(String.valueOf(userId))
                 .claim(CLAIM_EMAIL, email)
                 .claim(CLAIM_ROLE, role)
+                .claim(CLAIM_TOKEN_VERSION, tokenVersion)
                 .issuedAt(Date.from(issuedAt))
                 .expiration(Date.from(expiresAt))
                 .signWith(signingKey, Jwts.SIG.HS256)
@@ -83,10 +89,11 @@ public class JwtService {
             Long userId = Long.valueOf(claims.getSubject());
             String email = claims.get(CLAIM_EMAIL, String.class);
             String role = claims.get(CLAIM_ROLE, String.class);
-            if (email == null || role == null) {
+            Integer tokenVersion = claims.get(CLAIM_TOKEN_VERSION, Integer.class);
+            if (email == null || role == null || tokenVersion == null) {
                 return Optional.empty();
             }
-            return Optional.of(new AuthenticatedUser(userId, email, role));
+            return Optional.of(new AuthenticatedUser(userId, email, role, tokenVersion));
         } catch (JwtException | IllegalArgumentException ex) {
             log.debug("Rejected JWT: {}", ex.getMessage());
             return Optional.empty();

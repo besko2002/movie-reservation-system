@@ -10,6 +10,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMock
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.math.BigDecimal;
@@ -18,8 +19,12 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
@@ -51,6 +56,9 @@ class SchedulesIntegrationTest {
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
 
     @Value("${app.admin.email}")
     private String adminEmail;
@@ -127,6 +135,61 @@ class SchedulesIntegrationTest {
                         .content(scheduleBody(movieId, theaterId,
                                 start.plusMinutes(DURATION_MINUTES + bufferMinutes), "10.00", "20.00")))
                 .andExpect(status().isCreated());
+    }
+
+    @Test
+    void simultaneousOverlappingCreatesOnlyAllowOneSchedule() throws Exception {
+        String token = adminToken();
+        long movieId = createMovie(token, DURATION_MINUTES);
+        long theaterId = createTheater(token);
+        OffsetDateTime start = futureStart(6);
+        int workers = 6;
+        CountDownLatch ready = new CountDownLatch(workers);
+        CountDownLatch go = new CountDownLatch(1);
+        var pool = Executors.newFixedThreadPool(workers);
+        try {
+            var futures = new java.util.ArrayList<java.util.concurrent.Future<Integer>>();
+            for (int i = 0; i < workers; i++) {
+                futures.add(pool.submit(() -> {
+                    ready.countDown();
+                    if (!go.await(10, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("workers did not start together");
+                    }
+                    return mockMvc.perform(post("/api/schedules")
+                                    .header("Authorization", bearer(token))
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .content(scheduleBody(movieId, theaterId, start, "10.00", "20.00")))
+                            .andReturn().getResponse().getStatus();
+                }));
+            }
+            assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue();
+            go.countDown();
+            var statuses = new java.util.ArrayList<Integer>();
+            for (var future : futures) {
+                statuses.add(future.get(30, TimeUnit.SECONDS));
+            }
+            assertThat(statuses).containsExactlyInAnyOrder(201, 409, 409, 409, 409, 409);
+            assertThat(jdbcTemplate.queryForObject(
+                    "select count(*) from movie_schedules where theater_id = ? and start_time = ?",
+                    Integer.class, theaterId, start)).isEqualTo(1);
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void databaseRejectsOverlappingScheduleEvenWhenApplicationChecksAreBypassed() throws Exception {
+        String token = adminToken();
+        long movieId = createMovie(token, DURATION_MINUTES);
+        long theaterId = createTheater(token);
+        long existing = createSchedule(token, movieId, theaterId, futureStart(8));
+
+        assertThatThrownBy(() -> jdbcTemplate.update("""
+                insert into movie_schedules (movie_id, theater_id, start_time, end_time, base_price, vip_price)
+                select movie_id, theater_id, start_time, end_time, base_price, vip_price
+                from movie_schedules where id = ?
+                """, existing))
+                .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
     }
 
     @Test

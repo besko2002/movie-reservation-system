@@ -9,6 +9,9 @@ import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.security.SecurityRequirements;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
+import jakarta.servlet.http.HttpServletRequest;
+import com.example.moviereservation.security.AuthenticatedUser;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -24,9 +27,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class AuthController {
 
     private final UserService userService;
+    private final AuthRateLimiter rateLimiter;
 
-    public AuthController(UserService userService) {
+    public AuthController(UserService userService, AuthRateLimiter rateLimiter) {
         this.userService = userService;
+        this.rateLimiter = rateLimiter;
     }
 
     @PostMapping("/register")
@@ -38,7 +43,9 @@ public class AuthController {
             @ApiResponse(responseCode = "409", description = "Email already registered",
                     content = @Content(schema = @Schema(implementation = ApiError.class)))
     })
-    public ResponseEntity<AuthResponse> register(@Valid @RequestBody RegisterRequest request) {
+    public ResponseEntity<AuthResponse> register(@Valid @RequestBody RegisterRequest request,
+                                                 HttpServletRequest servletRequest) {
+        rateLimiter.registration(servletRequest.getRemoteAddr());
         return ResponseEntity.status(HttpStatus.CREATED).body(userService.register(request));
     }
 
@@ -49,7 +56,24 @@ public class AuthController {
             @ApiResponse(responseCode = "401", description = "Invalid email or password",
                     content = @Content(schema = @Schema(implementation = ApiError.class)))
     })
-    public ResponseEntity<AuthResponse> login(@Valid @RequestBody LoginRequest request) {
-        return ResponseEntity.ok(userService.login(request));
+    public ResponseEntity<AuthResponse> login(@Valid @RequestBody LoginRequest request,
+                                              HttpServletRequest servletRequest) {
+        String ip = servletRequest.getRemoteAddr(); // never trust unverified X-Forwarded-For
+        rateLimiter.checkLogin(ip, request.email());
+        try {
+            AuthResponse response = userService.login(request);
+            rateLimiter.successfulLogin(ip, request.email());
+            return ResponseEntity.ok(response);
+        } catch (org.springframework.security.authentication.BadCredentialsException ex) {
+            rateLimiter.failedLogin(ip, request.email());
+            throw ex;
+        }
+    }
+
+    @PostMapping("/logout")
+    @Operation(summary = "Invalidate all of the caller's access tokens")
+    public ResponseEntity<Void> logout(@AuthenticationPrincipal AuthenticatedUser principal) {
+        userService.logoutEverywhere(principal.id());
+        return ResponseEntity.noContent().build();
     }
 }

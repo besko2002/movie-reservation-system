@@ -98,6 +98,31 @@ class SeatMapAndHoldIntegrationTest extends AbstractSeatReservationIntegrationTe
     }
 
     @Test
+    void oneUserCannotAccumulateMoreThanThePerUserCapInOneSchedule() throws Exception {
+        String admin = adminToken();
+        Show show = createShow(admin, futureStart(), 4, 3); // 12 seats, enough to exceed the cap
+        TestUser user = registerUser();
+
+        List<Long> first = show.seatIds().subList(0, maxSeatsPerUser);
+        mockMvc.perform(post("/api/seat-reservations")
+                        .header("Authorization", bearer(user.token()))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(holdBody(show.scheduleId(), first)))
+                .andExpect(status().isCreated());
+
+        long extraSeat = show.seatIds().get(maxSeatsPerUser);
+        mockMvc.perform(post("/api/seat-reservations")
+                        .header("Authorization", bearer(user.token()))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(holdBody(show.scheduleId(), List.of(extraSeat))))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.message").value(containsString(
+                        "At most %d seat(s) can be held per user".formatted(maxSeatsPerUser))));
+
+        assertThat(seatStatus(show.scheduleId(), extraSeat)).isEqualTo("AVAILABLE");
+    }
+
+    @Test
     void anonymousHoldIsRejectedWith401() throws Exception {
         String admin = adminToken();
         Show show = createShow(admin);

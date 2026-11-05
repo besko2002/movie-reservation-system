@@ -14,12 +14,18 @@ final class StripeEvents {
 
     /** A completed hosted checkout: the buyer paid. */
     static String checkoutSessionCompleted(String eventId, String sessionId, long ticketId, String paymentIntentId) {
+        return checkoutSessionCompleted(eventId, sessionId, ticketId, paymentIntentId, 3500L, "usd");
+    }
+
+    /** A completed hosted checkout with the amount and currency the ticket actually carries. */
+    static String checkoutSessionCompleted(String eventId, String sessionId, long ticketId,
+                                           String paymentIntentId, long amountTotal, String currency) {
         return """
                 {"id":"%s","object":"event","type":"checkout.session.completed","data":{"object":{\
                 "id":"%s","object":"checkout.session","client_reference_id":"%d","payment_status":"paid",\
-                "payment_intent":"%s","amount_total":3500,"currency":"usd",\
+                "payment_intent":"%s","amount_total":%d,"currency":"%s",\
                 "metadata":{"ticketId":"%d","userId":"1","scheduleId":"1"}}}}"""
-                .formatted(eventId, sessionId, ticketId, paymentIntentId, ticketId);
+                .formatted(eventId, sessionId, ticketId, paymentIntentId, amountTotal, currency, ticketId);
     }
 
     /**
@@ -27,12 +33,18 @@ final class StripeEvents {
      * refunded from such a delivery, so it is the "manual follow-up" corner of the webhook.
      */
     static String checkoutSessionCompletedWithoutPaymentIntent(String eventId, String sessionId, long ticketId) {
+        return checkoutSessionCompletedWithoutPaymentIntent(eventId, sessionId, ticketId, 3500L, "usd");
+    }
+
+    /** Variant with the real ticket amount, so the only missing field is the payment intent. */
+    static String checkoutSessionCompletedWithoutPaymentIntent(String eventId, String sessionId, long ticketId,
+                                                              long amountTotal, String currency) {
         return """
                 {"id":"%s","object":"event","type":"checkout.session.completed","data":{"object":{\
                 "id":"%s","object":"checkout.session","client_reference_id":"%d","payment_status":"paid",\
-                "amount_total":3500,"currency":"usd",\
+                "amount_total":%d,"currency":"%s",\
                 "metadata":{"ticketId":"%d","userId":"1","scheduleId":"1"}}}}"""
-                .formatted(eventId, sessionId, ticketId, ticketId);
+                .formatted(eventId, sessionId, ticketId, amountTotal, currency, ticketId);
     }
 
     /** The hosted checkout was never paid and is now dead. */
@@ -60,6 +72,18 @@ final class StripeEvents {
                 "id":"ch_test_%d","object":"charge","refunded":true,"payment_intent":"%s",\
                 "metadata":{"ticketId":"%d"}}}}"""
                 .formatted(eventId, ticketId, paymentIntentId, ticketId);
+    }
+
+    /** A refund event carrying how much was charged and how much has been refunded so far. */
+    static String chargeRefunded(String eventId, String paymentIntentId, long ticketId,
+                                 long amount, long amountRefunded) {
+        return """
+                {"id":"%s","object":"event","type":"charge.refunded","data":{"object":{\
+                "id":"ch_test_%d","object":"charge","refunded":%s,"payment_intent":"%s",\
+                "amount":%d,"amount_refunded":%d,\
+                "metadata":{"ticketId":"%d"}}}}"""
+                .formatted(eventId, ticketId, amountRefunded >= amount, paymentIntentId,
+                        amount, amountRefunded, ticketId);
     }
 
     /** An event type this module does not act on. */

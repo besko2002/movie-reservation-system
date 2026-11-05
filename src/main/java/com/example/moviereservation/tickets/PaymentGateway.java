@@ -49,6 +49,24 @@ public interface PaymentGateway {
     RefundDto refund(String paymentIntentId, BigDecimal amount);
 
     /**
+     * Refunds with a stable idempotency key, so a retried refund after a database failure returns
+     * the <em>same</em> provider refund instead of moving money twice.
+     *
+     * <p>The default keeps simple implementations working; a real provider implementation should
+     * override it.
+     *
+     * @param paymentIntentId provider id of the payment to refund
+     * @param amount          amount to refund in the ticket's currency
+     * @param idempotencyKey  stable key for this refund, safe to reuse on every retry
+     * @return the created (or previously created) refund
+     * @throws ServiceUnavailableException when no payment provider is configured, or the provider
+     *                                    could not be reached
+     */
+    default RefundDto refund(String paymentIntentId, BigDecimal amount, String idempotencyKey) {
+        return refund(paymentIntentId, amount);
+    }
+
+    /**
      * Reads back a session created earlier, so a repeated checkout can hand the buyer the
      * <em>same</em> payment page instead of opening a second one (see
      * {@link TicketService#checkout}). Only the session id is stored in {@code tickets}, which is
@@ -60,6 +78,19 @@ public interface PaymentGateway {
      *                                    could not be reached
      */
     PaymentSessionDto retrieveCheckoutSession(String sessionId);
+
+    /**
+     * Expires a hosted payment page immediately, so a ticket that is being cancelled cannot still
+     * be paid through the page its buyer already has open.
+     *
+     * <p>Best effort from the caller's point of view: the cancellation must still succeed when the
+     * provider is down, because the webhook safety net refunds any payment that arrives late.
+     *
+     * @param sessionId provider id of the session to expire
+     * @throws ServiceUnavailableException when no payment provider is configured, or the provider
+     *                                    could not be reached
+     */
+    void expireCheckoutSession(String sessionId);
 
     /**
      * @return whether payments are actually configured; {@code false} for

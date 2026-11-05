@@ -44,7 +44,7 @@ class AdminReportIntegrationTest extends AbstractTicketIntegrationTest {
     // --- revenue -------------------------------------------------------------------------------
 
     @Test
-    @DisplayName("revenue sums only PAID tickets of the window; refunded and pending ones stay out")
+    @DisplayName("gross includes all captured payments; refunds are deducted in the refund window")
     void revenueCountsOnlyPaidTicketsInsideTheWindow() throws Exception {
         String adminToken = fixtures.adminToken();
         Show show = fixtures.createShow(adminToken);
@@ -77,11 +77,10 @@ class AdminReportIntegrationTest extends AbstractTicketIntegrationTest {
 
         JsonNode report = revenue(adminToken, windowStart, windowEnd);
 
-        assertThat(report.path("paidTickets").asLong()).isEqualTo(2);
-        assertThat(amount(report, "grossRevenue")).isEqualByComparingTo("35.00");
+        assertThat(report.path("paidTickets").asLong()).isEqualTo(3);
+        assertThat(amount(report, "grossRevenue")).isEqualByComparingTo("45.00");
         assertThat(report.path("refundedTickets").asLong()).isEqualTo(1);
         assertThat(amount(report, "refundedAmount")).isEqualByComparingTo("10.00");
-        // netRevenue == grossRevenue: the refunded ticket is not PAID anymore, so it was never added.
         assertThat(amount(report, "netRevenue")).isEqualByComparingTo("35.00");
         assertThat(report.path("currency").asText()).isNotBlank();
         assertThat(report.path("from").asText()).isNotBlank();
@@ -92,8 +91,8 @@ class AdminReportIntegrationTest extends AbstractTicketIntegrationTest {
         assertThat(byMovie).hasSize(1);
         assertThat(byMovie.get(0).path("movieId").asLong()).isEqualTo(show.movieId());
         assertThat(byMovie.get(0).path("title").asText()).isNotBlank();
-        assertThat(byMovie.get(0).path("tickets").asLong()).isEqualTo(2);
-        assertThat(new BigDecimal(byMovie.get(0).path("revenue").asText())).isEqualByComparingTo("35.00");
+        assertThat(byMovie.get(0).path("tickets").asLong()).isEqualTo(3);
+        assertThat(new BigDecimal(byMovie.get(0).path("revenue").asText())).isEqualByComparingTo("45.00");
 
         // byDay: the same money, grouped by the business day the payment landed on.
         JsonNode byDay = report.path("byDay");
@@ -106,8 +105,8 @@ class AdminReportIntegrationTest extends AbstractTicketIntegrationTest {
             dailyTickets += day.path("tickets").asLong();
             days.add(day.path("date").asText());
         }
-        assertThat(dailySum).isEqualByComparingTo("35.00");
-        assertThat(dailyTickets).isEqualTo(2);
+        assertThat(dailySum).isEqualByComparingTo("45.00");
+        assertThat(dailyTickets).isEqualTo(3);
         assertThat(days).contains(businessDayOfPayment(firstPaid).toString());
     }
 
@@ -136,6 +135,36 @@ class AdminReportIntegrationTest extends AbstractTicketIntegrationTest {
     }
 
     @Test
+    @DisplayName("partial and full refund deltas are counted once in their own window")
+    void refundLedgerPreservesHistoricalGrossAndDeduplicatesDeliveries() throws Exception {
+        String adminToken = fixtures.adminToken();
+        Show show = fixtures.createShow(adminToken);
+        TestUser buyer = fixtures.registerUser();
+        OffsetDateTime beforePayment = OffsetDateTime.now();
+        long ticketId = pendingTicket(buyer.token(), show.scheduleId(), List.of(show.seat(0)));
+        String intent = payTicket(ticketId);
+        OffsetDateTime afterPayment = OffsetDateTime.now();
+
+        long total = ticketTotalMinor(ticketId);
+        String partial = StripeEvents.chargeRefunded("evt_partial_" + ticketId, intent, ticketId,
+                total, total / 2);
+        deliver(partial).andExpect(status().isOk());
+        deliver(partial).andExpect(status().isOk());
+        deliver(StripeEvents.chargeRefunded("evt_full_" + ticketId, intent, ticketId,
+                total, total)).andExpect(status().isOk());
+
+        JsonNode paymentWindow = revenue(adminToken, beforePayment, afterPayment);
+        assertThat(amount(paymentWindow, "grossRevenue")).isEqualByComparingTo("25.00");
+        assertThat(amount(paymentWindow, "refundedAmount")).isEqualByComparingTo("0.00");
+
+        JsonNode refundWindow = revenue(adminToken, afterPayment, OffsetDateTime.now().plusMinutes(1));
+        assertThat(amount(refundWindow, "grossRevenue")).isEqualByComparingTo("0.00");
+        assertThat(refundWindow.path("refundedTickets").asLong()).isEqualTo(1);
+        assertThat(amount(refundWindow, "refundedAmount")).isEqualByComparingTo("25.00");
+        assertThat(amount(refundWindow, "netRevenue")).isEqualByComparingTo("-25.00");
+    }
+
+    @Test
     @DisplayName("revenue with from after to is a 400")
     void revenueRejectsInvertedWindow() throws Exception {
         String adminToken = fixtures.adminToken();
@@ -161,7 +190,8 @@ class AdminReportIntegrationTest extends AbstractTicketIntegrationTest {
         OffsetDateTime to = OffsetDateTime.parse(report.path("to").asText());
         assertThat(from).isBefore(to);
         assertThat(java.time.Duration.between(from, to).toDays()).isEqualTo(30);
-        assertThat(amount(report, "grossRevenue")).isEqualByComparingTo(amount(report, "netRevenue"));
+        assertThat(amount(report, "netRevenue")).isEqualByComparingTo(
+                amount(report, "grossRevenue").subtract(amount(report, "refundedAmount")));
     }
 
     // --- occupancy -----------------------------------------------------------------------------

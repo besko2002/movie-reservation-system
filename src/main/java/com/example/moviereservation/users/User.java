@@ -34,6 +34,12 @@ public class User {
     @Column(name = "role", nullable = false, length = 20)
     private Role role;
 
+    @Column(name = "token_version", nullable = false)
+    private int tokenVersion;
+
+    @Column(name = "enabled", nullable = false)
+    private boolean enabled = true;
+
     @Column(name = "created_at", nullable = false)
     private OffsetDateTime createdAt;
 
@@ -93,5 +99,17 @@ public class User {
 
     public OffsetDateTime getCreatedAt() {
         return createdAt;
+    }
+
+    public int getTokenVersion() {
+        return tokenVersion;
+    }
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    public void revokeTokens() {
+        tokenVersion++;
     }
 }

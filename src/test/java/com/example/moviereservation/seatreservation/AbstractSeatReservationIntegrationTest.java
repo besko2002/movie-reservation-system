@@ -62,6 +62,9 @@ abstract class AbstractSeatReservationIntegrationTest {
     @Value("${app.reservation.max-seats}")
     protected int maxSeats;
 
+    @Value("${app.reservation.max-seats-per-user}")
+    protected int maxSeatsPerUser;
+
     /** An authenticated test user: its database id and a valid bearer token. */
     protected record TestUser(long id, String token) {
     }
@@ -85,8 +88,13 @@ abstract class AbstractSeatReservationIntegrationTest {
     }
 
     protected Show createShow(String adminToken, OffsetDateTime start) throws Exception {
+        return createShow(adminToken, start, 2, 3);
+    }
+
+    protected Show createShow(String adminToken, OffsetDateTime start, int totalRows, int seatsPerRow)
+            throws Exception {
         long movieId = createMovie(adminToken);
-        long theaterId = createTheater(adminToken, 2, 3);
+        long theaterId = createTheater(adminToken, totalRows, seatsPerRow);
         long scheduleId = createSchedule(adminToken, movieId, theaterId, start);
         return new Show(movieId, theaterId, scheduleId, seatIdsOfSeatMap(scheduleId));
     }

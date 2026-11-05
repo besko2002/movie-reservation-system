@@ -27,7 +27,7 @@ repository — it calls that module's public service.
 | `theaters`        | Theaters (halls); creating one generates its seat grid (rows × seats per row, `NORMAL` / `VIP`). |
 | `seatreservation` | Seat map per showtime, timed seat holds, and a scheduled sweeper that releases expired holds. |
 | `tickets`         | Checkout through a `PaymentGateway` port (Stripe implementation), signature-verified webhook, cancellation + refund, admin reports. |
-| `security`        | `JwtService`, `JwtAuthenticationFilter`, stateless `SecurityConfig`. |
+| `security`        | `JwtService`, `JwtAuthenticationFilter`, stateless `SecurityConfig`, production-secret startup guard. |
 | `common`          | `ApiError`, `PageResponse`, exception types and the global exception handler. |
 | `config`          | `OpenApiConfig` (Swagger metadata), `SchedulingConfig`. |
 
@@ -64,7 +64,9 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw spring-boot:run
 - Swagger UI: <http://localhost:8080/swagger-ui.html> · OpenAPI JSON: `/v3/api-docs`
 - Health: <http://localhost:8080/actuator/health>
 
-Flyway migrations `V1`–`V7` run at startup and the admin user is seeded if missing.
+Flyway migrations `V1`–`V10` run at startup and the admin user is seeded if missing. `V10`
+adds a PostgreSQL exclusion constraint for non-overlapping showtimes; clean up any pre-existing
+overlaps before applying it to a database that predates this fix.
 
 ### (b) Everything in Docker
 
@@ -99,6 +101,9 @@ Every setting is an environment variable (`src/main/resources/application.yml` h
 | `DB_PASSWORD` | `movie` | Database password. |
 | `JWT_SECRET` | dev-only placeholder (≥ 32 bytes) | HS256 signing key. Must be at least 32 bytes or the app refuses to start. **Always override outside development.** |
 | `JWT_EXPIRATION` | `3600000` | Access-token lifetime in milliseconds (1 hour). |
+| `AUTH_LOGIN_FAILURES` | `5` | Failed logins per IP/email per window; an IP-wide ceiling is also applied. |
+| `AUTH_REGISTRATIONS_PER_IP` | `120` | Registration attempts per remote IP per window. |
+| `AUTH_RATE_WINDOW_SECONDS` | `60` | Per-instance auth limiter window; use a shared edge limiter for multiple replicas. |
 | `ADMIN_EMAIL` | `admin@cinema.local` | Seeded administrator's email (created at startup when absent). |
 | `ADMIN_PASSWORD` | `Admin@12345` | Seeded administrator's password. |
 | `ADMIN_NAME` | `System Admin` | Seeded administrator's display name. |
@@ -106,13 +111,19 @@ Every setting is an environment variable (`src/main/resources/application.yml` h
 | `STRIPE_WEBHOOK_SECRET` | *(empty)* | Webhook signing secret (`whsec_…`); the raw body is verified with HMAC-SHA256. |
 | `STRIPE_CURRENCY` | `usd` | ISO 4217 currency of every Checkout Session and refund. |
 | `TICKET_CANCELLATION_CUTOFF_HOURS` | `2` | A PAID ticket can be cancelled (full refund) only until this many hours before the showtime. |
-| `TICKET_CHECKOUT_MINUTES` | `30` | Payment window: both the Checkout Session's `expires_at` and the extended seat-hold expiry. Stripe accepts 30–1440; outside that range the app fails to start. |
+| `TICKET_CHECKOUT_MINUTES` | `35` | Payment window: both the Checkout Session's `expires_at` and the extended seat-hold expiry. Stripe accepts 30–1440; outside that range the app fails to start. |
 | `SCHEDULE_BUFFER_MINUTES` | `15` | Cleaning time added after the movie duration when computing a schedule's `end_time`. |
 | `SCHEDULE_ZONE` | `UTC` | Business time zone used to interpret `GET /api/schedules?date=yyyy-MM-dd`. |
 | `RESERVATION_HOLD_MINUTES` | `10` | How long a seat hold stays valid. |
 | `RESERVATION_MAX_SEATS` | `10` | Maximum seats per hold request. |
+| `RESERVATION_MAX_SEATS_PER_USER` | `8` | Maximum active seats (held or paid) one user may occupy in one schedule. |
 | `RESERVATION_SWEEP_MS` | `60000` | Interval of the expired-hold sweeper, in milliseconds. |
 | `APP_BASE_URL` | `http://localhost:8080` | Absolute base URL used to build Stripe success/cancel return URLs. |
+
+For deployment, activate `SPRING_PROFILES_ACTIVE=prod`, supply strong `JWT_SECRET`,
+`ADMIN_PASSWORD` and `DB_PASSWORD`, and terminate HTTPS before the API. The `prod` profile
+rejects published secrets and disables Swagger/OpenAPI. The compose defaults are **local-demo only**.
+Postgres binds to `127.0.0.1:5434` rather than the public interface.
 
 ### Seeded admin — change it
 
@@ -125,7 +136,9 @@ password: Admin@12345
 
 > **Warning:** these are development credentials. Set `ADMIN_EMAIL` / `ADMIN_PASSWORD` (and a real
 > `JWT_SECRET`) before exposing the API anywhere — and change the password of any admin that was
-> already seeded with the default.
+> already seeded with the default. Production deployments should also set
+> `SPRING_PROFILES_ACTIVE=prod`: the application then refuses to start while either published
+> default is still in use.
 
 ## Endpoints
 
@@ -193,18 +206,20 @@ password: Admin@12345
 
 | Method & path | Auth | Description |
 | ------------- | ---- | ----------- |
-| `POST /api/tickets` | USER | Checkout `{scheduleId}` → `PENDING_PAYMENT` ticket + Stripe `checkoutUrl`. Idempotent per (user, schedule): `201` when created, `200` when an existing pending ticket is returned. `503` when Stripe is not configured. |
-| `GET /api/tickets/me` | USER | The caller's tickets, newest first. |
+| `POST /api/tickets` | USER | Checkout `{scheduleId}` → `PENDING_PAYMENT` ticket + Stripe `checkoutUrl`. Idempotent per (user, schedule), including simultaneous requests: `201` when created, `200` when an existing pending ticket is returned; `409` after the showtime starts. `503` when Stripe is not configured. |
+| `GET /api/tickets/me?page=&size=` | USER | Paginated tickets, newest first (default 20; maximum 100). Returns a page envelope. |
 | `GET /api/tickets/{id}` | USER | One ticket (your own; an ADMIN may read any). |
-| `DELETE /api/tickets/{id}` | USER | Cancel a ticket; a PAID one is refunded in full if the cutoff has not passed. |
+| `DELETE /api/tickets/{id}` | USER | Cancel a ticket; a pending one also expires its Stripe page, a PAID one is refunded in full if the cutoff has not passed. A payment that still lands after cancellation is refunded by the webhook. |
 | `POST /api/payments/stripe/webhook` | Stripe signature | Webhook deliveries; public route, authenticated by the `Stripe-Signature` header. |
+| `POST /api/auth/logout` | USER | Revoke all issued JWTs for this account; sign in again for a new token. |
+| `GET /payment/success`, `/payment/cancel` | public | Non-sensitive browser return pages; the verified webhook, not the redirect, confirms payment. |
 
 ### Admin reports (`tickets`)
 
 | Method & path | Auth | Description |
 | ------------- | ---- | ----------- |
 | `GET /api/admin/tickets?status=&scheduleId=&userId=&page=&size=` | ADMIN | Every ticket, newest first. |
-| `GET /api/admin/reports/revenue?from=&to=` | ADMIN | Revenue of a window (`from` defaults to 30 days before `to`, `to` to now). |
+| `GET /api/admin/reports/revenue?from=&to=` | ADMIN | Gross captures by payment time, refund deltas by refund time, net = gross − refunds. Multiple currencies in one window are rejected rather than summed. |
 | `GET /api/admin/reports/occupancy/{scheduleId}` | ADMIN | How full one showtime is. |
 
 ### Operations
@@ -212,8 +227,8 @@ password: Admin@12345
 | Method & path | Auth | Description |
 | ------------- | ---- | ----------- |
 | `GET /actuator/health` | public | Liveness/readiness (`{"status":"UP"}`); used by the container `HEALTHCHECK`. |
-| `GET /swagger-ui.html` | public | Swagger UI. |
-| `GET /v3/api-docs` | public | OpenAPI 3 document. |
+| `GET /swagger-ui.html` | public in development | Swagger UI (disabled with the `prod` profile). |
+| `GET /v3/api-docs` | public in development | OpenAPI 3 document (disabled with the `prod` profile). |
 
 ## Booking flow, end to end
 
@@ -285,12 +300,15 @@ works.
 curl -s -X POST "$BASE/api/payments/stripe/webhook" \
   -H 'Content-Type: application/json' \
   -H 'Stripe-Signature: t=1700000000,v1=<hmac-sha256-of-"t.payload"-with-STRIPE_WEBHOOK_SECRET>' \
-  --data-binary '{"id":"evt_1","type":"checkout.session.completed","data":{"object":{"id":"cs_test_123"}}}'
+  --data-binary '{"id":"evt_1","type":"checkout.session.completed","data":{"object":{"id":"cs_test_123","object":"checkout.session","client_reference_id":"7","payment_status":"paid","payment_intent":"pi_123","amount_total":2500,"currency":"usd"}}}'
 ```
 
-A verified `checkout.session.completed` marks the ticket **PAID** and its reservations `CONFIRMED`;
-a failed or expired session cancels the ticket and releases the seats. An invalid signature is
-rejected with `400` and changes nothing.
+A verified `checkout.session.completed` marks the ticket **PAID** and its reservations `CONFIRMED`
+only when `payment_status` is `paid` and the event's amount and currency match the ticket; it also
+fills a missing session reference but never overwrites an existing one. A failed or expired session
+cancels the ticket and releases the seats. If a payment still arrives for an already cancelled or
+expired ticket, or for the wrong amount, the webhook refunds it instead of keeping the money. An
+invalid signature is rejected with `400` and changes nothing.
 
 **6 — Check the result, cancel if needed.**
 
@@ -356,9 +374,11 @@ and the endpoints that need a provider answer `503` instead of failing with a `5
 JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw clean verify
 ```
 
-173 tests: unit tests plus `@SpringBootTest` slices that start a **real PostgreSQL 16 via
+199 tests: unit tests plus `@SpringBootTest` slices that start a **real PostgreSQL 16 via
 Testcontainers** — Docker must be running. No test ever calls Stripe over the network: every payment
-goes through the `PaymentGateway` port, which is stubbed in tests.
+goes through the `PaymentGateway` port, which is stubbed in tests. The suite covers the late-payment
+refund, concurrent checkout, unpaid and async payment events, amount and session mismatches, partial
+refunds, the per-user seat cap and the production-secret guard.
 
 ## Project structure
 

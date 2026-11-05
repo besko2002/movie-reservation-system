@@ -1,6 +1,7 @@
 package com.example.moviereservation.tickets;
 
 import com.example.moviereservation.common.ConflictException;
+import com.example.moviereservation.common.PageResponse;
 import com.example.moviereservation.common.ResourceNotFoundException;
 import com.example.moviereservation.movies.ScheduleDto;
 import com.example.moviereservation.movies.ScheduleService;
@@ -11,14 +12,20 @@ import com.example.moviereservation.theaters.TheaterService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Currency;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -56,15 +63,25 @@ import java.util.Optional;
  * idempotent checkout does not extend anything — it hands back the original page, which still
  * expires with the original holds.
  *
- * <p>Should a payment nevertheless arrive with the seats gone, the ticket is <em>not</em> marked
- * PAID: the charge is refunded in full and the ticket becomes REFUNDED (see
- * {@code refundPaymentWithoutSeats}). The system never keeps money it cannot deliver seats for.
+ * <p>Should a payment nevertheless arrive with the seats gone, or after the ticket was cancelled or
+ * expired, the ticket is <em>not</em> marked PAID: the captured amount is refunded and the ticket
+ * becomes REFUNDED (see {@code refundPaymentWithoutSeats}). The system never keeps money it cannot
+ * deliver seats for. A cancelled pending ticket also asks the gateway to expire its hosted page,
+ * so a late payment is normally prevented rather than merely compensated.
+ *
+ * <h2>Concurrency</h2>
+ * Checkout takes a transaction-scoped PostgreSQL advisory lock keyed by (user, schedule) before it
+ * checks for an existing pending ticket, so two simultaneous requests create one ticket and one
+ * payment page. Ticket state transitions take a row lock: a webhook and a cancellation racing for
+ * the same ticket are serialized, and the second one sees the first one's committed status.
  *
  * <h2>Webhook idempotency</h2>
  * Every transition is guarded by the current status ({@code PENDING_PAYMENT -> PAID} and so on).
  * A redelivered event therefore finds the ticket already in its target state and does nothing,
  * which is exactly what Stripe's at-least-once delivery needs. No separate "processed events"
  * table is required because each event type has one target state and that state is idempotent.
+ * Refunds additionally use a stable per-ticket idempotency key, so a redelivery after a database
+ * failure asks Stripe for the same refund instead of creating a second one.
  *
  * <h2>Module boundaries</h2>
  * Seats are read and changed only through {@link SeatReservationService}, schedules only through
@@ -76,7 +93,11 @@ public class TicketService {
 
     private static final Logger log = LoggerFactory.getLogger(TicketService.class);
 
+    public static final int DEFAULT_PAGE_SIZE = 20;
+    public static final int MAX_PAGE_SIZE = 100;
+
     private final TicketRepository ticketRepository;
+    private final TicketRefundRepository refundRepository;
     private final SeatReservationService seatReservationService;
     private final ScheduleService scheduleService;
     private final TheaterService theaterService;
@@ -87,6 +108,7 @@ public class TicketService {
     private final int cancellationCutoffHours;
 
     public TicketService(TicketRepository ticketRepository,
+                         TicketRefundRepository refundRepository,
                          SeatReservationService seatReservationService,
                          ScheduleService scheduleService,
                          TheaterService theaterService,
@@ -95,6 +117,7 @@ public class TicketService {
                          @Value("${app.stripe.currency}") String currency,
                          @Value("${app.ticket.cancellation-cutoff-hours}") int cancellationCutoffHours) {
         this.ticketRepository = ticketRepository;
+        this.refundRepository = refundRepository;
         this.seatReservationService = seatReservationService;
         this.scheduleService = scheduleService;
         this.theaterService = theaterService;
@@ -139,6 +162,16 @@ public class TicketService {
         if (!scheduleService.scheduleExists(scheduleId)) {
             throw new ResourceNotFoundException("Schedule", scheduleId);
         }
+        OffsetDateTime startTime = scheduleService.getStartTime(scheduleId);
+        if (!startTime.isAfter(OffsetDateTime.now())) {
+            throw new ConflictException(
+                    "Schedule %d already started at %s; tickets cannot be bought for it anymore"
+                            .formatted(scheduleId, format(startTime)));
+        }
+        // Serializes the check-then-create below for this buyer and showtime. Without it, two
+        // simultaneous requests can both see "no pending ticket" and create two payable sessions.
+        ticketRepository.lockCheckoutPair(checkoutLockKey(userId, scheduleId));
+
         List<SeatReservationDto> held = seatReservationService.getHeldSeatsForUser(userId, scheduleId);
         if (held.isEmpty()) {
             throw new ConflictException(
@@ -207,10 +240,12 @@ public class TicketService {
      * @return the caller's tickets, newest first, each with its seats
      */
     @Transactional(readOnly = true)
-    public List<TicketDto> listMyTickets(Long userId) {
-        return ticketRepository.findByUserIdOrderByIdDesc(userId).stream()
-                .map(this::toDto)
-                .toList();
+    public PageResponse<TicketDto> listMyTickets(Long userId, Integer page, Integer size) {
+        Page<Ticket> tickets = ticketRepository.findByUserId(userId, PageRequest.of(
+                page == null || page < 0 ? 0 : page,
+                size == null || size < 1 ? DEFAULT_PAGE_SIZE : Math.min(size, MAX_PAGE_SIZE),
+                Sort.by(Sort.Order.desc("id"))));
+        return PageResponse.of(tickets, toDtos(tickets.getContent()));
     }
 
     /**
@@ -252,7 +287,9 @@ public class TicketService {
      */
     @Transactional
     public void cancelTicket(Long ticketId, Long requesterId, boolean requesterIsAdmin) {
-        Ticket ticket = requireOwnedTicket(ticketId, requesterId, requesterIsAdmin);
+        // Locked: a webhook for this ticket may be arriving at the same time. Whichever transaction
+        // gets here second sees the status the first one committed, never a stale PENDING_PAYMENT.
+        Ticket ticket = requireOwnedTicketForUpdate(ticketId, requesterId, requesterIsAdmin);
         OffsetDateTime now = OffsetDateTime.now();
 
         switch (ticket.getStatus()) {
@@ -261,6 +298,9 @@ public class TicketService {
                 // Only the holds attached to this ticket go; other holds of the user stay.
                 seatReservationService.releaseSeatsOfTicket(ticketId);
                 ticketRepository.flush();
+                // The buyer may still have the hosted page open. Expiring it prevents a payment;
+                // if the provider is unreachable, the webhook safety net refunds a late payment.
+                expireCheckoutSessionQuietly(ticket);
                 log.info("Cancelled pending ticket {} of user {}", ticketId, ticket.getUserId());
             }
             case PAID -> {
@@ -270,13 +310,17 @@ public class TicketService {
                             ("Ticket %d is paid but carries no payment reference yet; "
                                     + "please retry in a moment").formatted(ticketId));
                 }
-                RefundDto refund = paymentGateway.refund(ticket.getStripePaymentIntentId(), ticket.getTotalPrice());
+                BigDecimal remaining = ticket.getTotalPrice().subtract(refundedSoFar(ticketId));
+                RefundDto refund = remaining.signum() > 0
+                        ? paymentGateway.refund(ticket.getStripePaymentIntentId(), remaining, refundKey(ticketId))
+                        : null;
+                recordRefund(ticket, remaining, now);
                 ticket.markRefunded(now);
                 seatReservationService.releaseSeatsOfTicket(ticketId);
                 ticketRepository.flush();
                 log.info("Refunded ticket {} of user {} ({} {}, refund {})",
                         ticketId, ticket.getUserId(), ticket.getTotalPrice(), ticket.getCurrency(),
-                        refund.refundId());
+                        refund == null ? "already fully refunded" : refund.refundId());
             }
             default -> throw new ConflictException(
                     "Ticket %d is already %s and cannot be cancelled".formatted(ticketId, ticket.getStatus()));
@@ -306,11 +350,15 @@ public class TicketService {
     @Transactional
     public String applyPaymentEvent(PaymentEvent event) {
         return switch (event.type()) {
-            case PaymentEvent.CHECKOUT_SESSION_COMPLETED -> applyCompleted(event);
+            case PaymentEvent.CHECKOUT_SESSION_COMPLETED,
+                 PaymentEvent.CHECKOUT_SESSION_ASYNC_PAYMENT_SUCCEEDED -> applyCompleted(event);
             case PaymentEvent.CHECKOUT_SESSION_EXPIRED ->
                     applyTerminal(event, TicketStatus.EXPIRED, "session expired");
-            case PaymentEvent.PAYMENT_INTENT_PAYMENT_FAILED ->
+            case PaymentEvent.CHECKOUT_SESSION_ASYNC_PAYMENT_FAILED ->
                     applyTerminal(event, TicketStatus.CANCELLED, "payment failed");
+            // A card decline can be retried on the same hosted Checkout page. Do not release its
+            // seats until the session expires or a terminal async failure is reported.
+            case PaymentEvent.PAYMENT_INTENT_PAYMENT_FAILED -> "ignored: payment attempt can be retried";
             case PaymentEvent.CHARGE_REFUNDED -> applyRefunded(event);
             default -> {
                 log.debug("Ignoring unhandled payment event type {} ({})", event.type(), event.id());
@@ -330,10 +378,66 @@ public class TicketService {
             log.debug("Ticket {} is already PAID; event {} changes nothing", ticket.getId(), event.id());
             return "ignored: ticket %d is already PAID".formatted(ticket.getId());
         }
-        if (!ticket.getStatus().isPending()) {
-            log.warn("Payment succeeded for ticket {} which is {}; manual follow-up needed (event {})",
-                    ticket.getId(), ticket.getStatus(), event.id());
-            return "ignored: ticket %d is %s".formatted(ticket.getId(), ticket.getStatus());
+        if (ticket.getStatus() == TicketStatus.REFUNDED) {
+            // The money was already given back; a late completed event must not refund it again.
+            log.debug("Ticket {} is already REFUNDED; event {} changes nothing", ticket.getId(), event.id());
+            return "ignored: ticket %d is already REFUNDED".formatted(ticket.getId());
+        }
+        if (ticket.getStatus().isFinal()) {
+            // The buyer cancelled or the session expired, but a payment still landed. Most likely
+            // the checkout page was open when the cancellation happened. The money cannot buy a
+            // ticket, so it is refunded automatically instead of being kept or left for a human.
+            if (!"paid".equalsIgnoreCase(event.paymentStatus())) {
+                log.info("Ticket {} is {} and event {} is not paid; nothing to refund",
+                        ticket.getId(), ticket.getStatus(), event.id());
+                return "ignored: ticket %d is %s and the payment is not completed"
+                        .formatted(ticket.getId(), ticket.getStatus());
+            }
+            log.warn("Payment succeeded for {} ticket {}; refunding it automatically (event {})",
+                    ticket.getStatus(), ticket.getId(), event.id());
+            return refundPaymentWithoutSeats(ticket, event,
+                    "the ticket was already " + ticket.getStatus());
+        }
+
+        // checkout.session.completed can arrive for delayed methods while the session is still
+        // unpaid; only Stripe's "paid" value means the money is actually there.
+        if (!"paid".equalsIgnoreCase(event.paymentStatus())) {
+            log.warn("Event {} reports payment_status={} for ticket {}; leaving it PENDING_PAYMENT",
+                    event.id(), event.paymentStatus(), ticket.getId());
+            return "ignored: payment not completed (payment_status=%s)".formatted(event.paymentStatus());
+        }
+
+        // Never let an event for one Checkout Session pay a different session's ticket. The ticket
+        // id in metadata is a lookup hint, not proof that this session belongs to it.
+        if (event.sessionId() != null
+                && ticket.getStripeSessionId() != null
+                && !event.sessionId().equals(ticket.getStripeSessionId())) {
+            log.error("Event {} is for session {} but ticket {} was opened with session {}; ignoring it",
+                    event.id(), event.sessionId(), ticket.getId(), ticket.getStripeSessionId());
+            return "ignored: session %s does not match ticket %d"
+                    .formatted(event.sessionId(), ticket.getId());
+        }
+
+        // The amount and currency must be exactly what this ticket was priced at. A mismatch means
+        // the payment cannot buy this ticket, so a captured charge is refunded rather than kept.
+        if (event.amountTotal() != null && event.currency() != null) {
+            long expectedAmount = toMinorUnits(ticket.getTotalPrice(), ticket.getCurrency());
+            if (event.amountTotal() != expectedAmount
+                    || !event.currency().equalsIgnoreCase(ticket.getCurrency())) {
+                log.error("Event {} paid {} {} but ticket {} costs {} {}; refunding the payment",
+                        event.id(), event.amountTotal(), event.currency(),
+                        ticket.getId(), ticket.getTotalPrice(), ticket.getCurrency());
+                if (event.paymentIntentId() == null) {
+                    return manualFollowUp(ticket, event, "amount/currency mismatch");
+                }
+                return refundPaymentWithoutSeats(ticket, event, "amount/currency mismatch",
+                        fromMinorUnits(event.amountTotal(), event.currency()));
+            }
+        }
+
+        // A paid ticket needs its payment intent: without it the buyer could never be refunded.
+        if (event.paymentIntentId() == null) {
+            return manualFollowUp(ticket, event, "no payment intent id");
         }
 
         // Are ALL the seats this ticket was priced for still held? Asked before anything is written,
@@ -344,11 +448,13 @@ public class TicketService {
         List<SeatReservationDto> attached = seatReservationService.listReservationsOfTicket(ticket.getId());
         List<SeatReservationDto> live = seatReservationService.listLiveHeldSeatsOfTicket(ticket.getId());
         if (attached.isEmpty() || live.size() != attached.size()) {
-            return refundPaymentWithoutSeats(ticket, event);
+            return refundPaymentWithoutSeats(ticket, event, "the seat holds are gone");
         }
 
         ticket.markPaid(event.paymentIntentId(), OffsetDateTime.now());
-        if (event.sessionId() != null) {
+        if (ticket.getStripeSessionId() == null && event.sessionId() != null) {
+            // Only fill a missing reference; never overwrite the session this ticket was opened
+            // with, because that is what binds the next event to the right ticket.
             ticket.setStripeSessionId(event.sessionId());
         }
         ticketRepository.flush();
@@ -358,11 +464,12 @@ public class TicketService {
     }
 
     /**
-     * Safety net for money that arrives when the seats are gone — clock skew, an admin who released
-     * the holds, a delivery that was stuck for hours. Normally impossible, because
-     * {@link TicketCheckoutWindow} makes the seat holds live exactly as long as the payment page.
+     * Safety net for money that arrives when the ticket cannot be delivered — the seats are gone,
+     * the ticket was already cancelled or expired, or the amount/currency does not match. Normally
+     * impossible, because {@link TicketCheckoutWindow} makes the seat holds live exactly as long as
+     * the payment page and cancellation expires the page.
      *
-     * <p><strong>The money is never kept.</strong> The ticket does not become PAID: a full refund is
+     * <p><strong>The money is never kept.</strong> The ticket does not become PAID: a refund is
      * requested and the ticket becomes REFUNDED in the same transaction, so it can never be left
      * PAID-without-seats. The answer is still 200 — the delivery was genuine and there is nothing
      * for Stripe to retry.
@@ -380,31 +487,57 @@ public class TicketService {
      *       of the same event would not conjure up a payment intent either.</li>
      * </ul>
      */
-    private String refundPaymentWithoutSeats(Ticket ticket, PaymentEvent event) {
+    private String refundPaymentWithoutSeats(Ticket ticket, PaymentEvent event, String reason) {
+        return refundPaymentWithoutSeats(ticket, event, reason, null);
+    }
+
+    private String refundPaymentWithoutSeats(Ticket ticket, PaymentEvent event, String reason,
+                                             BigDecimal amountOverride) {
         String paymentIntentId = event.paymentIntentId() != null
                 ? event.paymentIntentId()
                 : ticket.getStripePaymentIntentId();
         if (paymentIntentId == null) {
-            log.error("Payment event {} completed ticket {} but its seat holds are gone AND the event carries no "
-                            + "payment intent id: the charge cannot be refunded automatically, manual follow-up "
-                            + "needed", event.id(), ticket.getId());
-            return ("manual-follow-up: ticket %d was paid without seats and carries no payment intent id; it was "
-                    + "left %s and has to be refunded by hand")
-                    .formatted(ticket.getId(), ticket.getStatus());
+            return manualFollowUp(ticket, event, reason + " and no payment intent id");
         }
+        BigDecimal refundAmount = amountOverride != null
+                ? amountOverride
+                : event.amountTotal() != null && event.currency() != null
+                        ? fromMinorUnits(event.amountTotal(), event.currency())
+                        : ticket.getTotalPrice();
 
-        RefundDto refund = paymentGateway.refund(paymentIntentId, ticket.getTotalPrice());
+        // The key is stable per ticket: if Stripe succeeded but this transaction rolled back, the
+        // redelivered event asks for the same refund and Stripe returns the original one instead of
+        // moving the money a second time.
+        RefundDto refund = paymentGateway.refund(paymentIntentId, refundAmount,
+                refundKey(ticket.getId()));
         ticket.setStripePaymentIntentId(paymentIntentId);
-        if (event.sessionId() != null) {
+        if (ticket.getStripeSessionId() == null && event.sessionId() != null) {
             ticket.setStripeSessionId(event.sessionId());
         }
-        ticket.markRefunded(OffsetDateTime.now());
+        OffsetDateTime now = OffsetDateTime.now();
+        // Compensating refunds can occur before the normal PAID transition. Preserve the capture
+        // timestamp for historical gross reporting when the amount/currency match this ticket.
+        if (event.currency() != null && event.currency().equalsIgnoreCase(ticket.getCurrency())
+                && refundAmount.compareTo(ticket.getTotalPrice()) == 0) {
+            ticket.recordCapturedAt(now);
+        }
+        recordRefund(ticket, refundAmount, now);
+        ticket.markRefunded(now);
         releaseEverythingOf(ticket);
         ticketRepository.flush();
-        log.warn("Ticket {} was paid after its seat holds were gone; refunded {} {} in full (refund {}, event {})",
-                ticket.getId(), ticket.getTotalPrice(), ticket.getCurrency(), refund.refundId(), event.id());
-        return ("refunded: ticket %d was paid after its seat holds were gone, so the payment was refunded in full")
-                .formatted(ticket.getId());
+        log.warn("Ticket {} cannot be delivered ({}); refunded {} {} in full (refund {}, event {})",
+                ticket.getId(), reason, refundAmount, ticket.getCurrency(), refund.refundId(), event.id());
+        return ("refunded: ticket %d cannot be delivered (%s), so the payment was refunded in full")
+                .formatted(ticket.getId(), reason);
+    }
+
+    private String manualFollowUp(Ticket ticket, PaymentEvent event, String reason) {
+        log.error("Payment event {} completed ticket {} but {}; the charge cannot be refunded automatically, "
+                        + "manual follow-up needed (ticket left {})",
+                event.id(), ticket.getId(), reason, ticket.getStatus());
+        return ("manual-follow-up: ticket %d cannot be delivered (%s) and carries no payment intent id; "
+                + "it was left %s and has to be refunded by hand")
+                .formatted(ticket.getId(), reason, ticket.getStatus());
     }
 
     private String applyTerminal(PaymentEvent event, TicketStatus target, String reason) {
@@ -436,19 +569,46 @@ public class TicketService {
             return notFound(event);
         }
         Ticket ticket = found.get();
-        if (ticket.getStatus() == TicketStatus.REFUNDED) {
-            log.debug("Ticket {} is already REFUNDED; event {} changes nothing", ticket.getId(), event.id());
-            return "ignored: ticket %d is already REFUNDED".formatted(ticket.getId());
-        }
-        if (ticket.getStatus() != TicketStatus.PAID) {
+        if (ticket.getStatus() != TicketStatus.PAID && ticket.getStatus() != TicketStatus.REFUNDED) {
             log.warn("Refund event {} for ticket {} which is {}", event.id(), ticket.getId(), ticket.getStatus());
             return "ignored: ticket %d is %s".formatted(ticket.getId(), ticket.getStatus());
         }
-        ticket.markRefunded(OffsetDateTime.now());
+        if (event.currency() != null && !event.currency().equalsIgnoreCase(ticket.getCurrency())) {
+            log.error("Refund event {} currency {} differs from ticket {} currency {}",
+                    event.id(), event.currency(), ticket.getId(), ticket.getCurrency());
+            return "ignored: refund currency mismatch";
+        }
+        BigDecimal cumulative = event.amountRefunded() == null
+                ? ticket.getTotalPrice()
+                : fromMinorUnits(event.amountRefunded(), ticket.getCurrency());
+        BigDecimal delta = cumulative.subtract(refundedSoFar(ticket.getId()));
+        if (delta.signum() <= 0) {
+            return "ignored: refund already recorded for ticket %d".formatted(ticket.getId());
+        }
+        OffsetDateTime now = OffsetDateTime.now();
+        recordRefund(ticket, delta, now);
+        if (event.amount() != null && event.amountRefunded() != null
+                && event.amountRefunded() < event.amount()) {
+            log.info("Partial refund for ticket {} ({}/{} minor units); ticket stays PAID",
+                    ticket.getId(), event.amountRefunded(), event.amount());
+            return "applied: partial refund for ticket %d, still PAID".formatted(ticket.getId());
+        }
+        ticket.markRefunded(now);
         releaseEverythingOf(ticket);
         ticketRepository.flush();
         log.info("Ticket {} is REFUNDED and its seats are released (event {})", ticket.getId(), event.id());
         return "applied: ticket %d is REFUNDED".formatted(ticket.getId());
+    }
+
+    private BigDecimal refundedSoFar(Long ticketId) {
+        BigDecimal amount = refundRepository.sumForTicket(ticketId);
+        return amount == null ? BigDecimal.ZERO : amount;
+    }
+
+    private void recordRefund(Ticket ticket, BigDecimal amount, OffsetDateTime now) {
+        if (amount.signum() > 0) {
+            refundRepository.saveAndFlush(new TicketRefund(ticket.getId(), amount, now));
+        }
     }
 
     /** Frees the seats attached to this ticket; the buyer's other holds are not this ticket's. */
@@ -464,22 +624,26 @@ public class TicketService {
         return "ignored: no ticket matches event " + event.id();
     }
 
-    /** ticket id from the event, else the unique session id, else the payment intent. */
+    /**
+     * ticket id from the event, else the unique session id, else the payment intent. Every lookup
+     * takes a row lock, so a redelivery racing the first delivery waits for it and then sees the
+     * resulting status instead of applying the same transition twice.
+     */
     private Optional<Ticket> findTicketOf(PaymentEvent event) {
         if (event.ticketId() != null) {
-            Optional<Ticket> byId = ticketRepository.findById(event.ticketId());
+            Optional<Ticket> byId = ticketRepository.findByIdForUpdate(event.ticketId());
             if (byId.isPresent()) {
                 return byId;
             }
         }
         if (event.sessionId() != null) {
-            Optional<Ticket> bySession = ticketRepository.findByStripeSessionId(event.sessionId());
+            Optional<Ticket> bySession = ticketRepository.findByStripeSessionIdForUpdate(event.sessionId());
             if (bySession.isPresent()) {
                 return bySession;
             }
         }
         if (event.paymentIntentId() != null) {
-            return ticketRepository.findByStripePaymentIntentIdOrderByIdDesc(event.paymentIntentId())
+            return ticketRepository.findByStripePaymentIntentIdForUpdate(event.paymentIntentId())
                     .stream().findFirst();
         }
         return Optional.empty();
@@ -496,6 +660,67 @@ public class TicketService {
         return ticket;
     }
 
+    private Ticket requireOwnedTicketForUpdate(Long ticketId, Long requesterId, boolean requesterIsAdmin) {
+        Ticket ticket = ticketRepository.findByIdForUpdate(ticketId)
+                .orElseThrow(() -> new ResourceNotFoundException("Ticket", ticketId));
+        if (!requesterIsAdmin && !ticket.isOwnedBy(requesterId)) {
+            throw new AccessDeniedException("Ticket %d belongs to another user".formatted(ticketId));
+        }
+        return ticket;
+    }
+
+    /**
+     * Stable transaction-scoped lock key for one buyer's checkout in one schedule. Collisions only
+     * make two unrelated checkouts wait for each other; they never mix data.
+     */
+    private static long checkoutLockKey(Long userId, Long scheduleId) {
+        return (userId << 32) ^ scheduleId;
+    }
+
+    /** Stable idempotency key for every refund attempt of one ticket. */
+    private static String refundKey(Long ticketId) {
+        return "ticket-%d-refund".formatted(ticketId);
+    }
+
+    private void expireCheckoutSessionQuietly(Ticket ticket) {
+        if (ticket.getStripeSessionId() == null || ticket.getStripeSessionId().isBlank()) {
+            return;
+        }
+        try {
+            paymentGateway.expireCheckoutSession(ticket.getStripeSessionId());
+        } catch (RuntimeException ex) {
+            // The cancellation itself must still succeed. If the page cannot be expired and a
+            // payment lands later, applyCompleted() refunds it automatically.
+            log.warn("Ticket {} was cancelled but its Checkout Session {} could not be expired; "
+                            + "a late payment will be refunded by the webhook",
+                    ticket.getId(), ticket.getStripeSessionId(), ex);
+        }
+    }
+
+    /** Converts a major-unit amount to Stripe's minor unit for that ticket's currency. */
+    private static long toMinorUnits(BigDecimal amount, String currencyCode) {
+        return amount.setScale(fractionDigitsOf(currencyCode), RoundingMode.HALF_UP)
+                .movePointRight(fractionDigitsOf(currencyCode))
+                .longValueExact();
+    }
+
+    /** Converts a Stripe minor-unit amount back to the major unit used by tickets. */
+    private static BigDecimal fromMinorUnits(long amount, String currencyCode) {
+        return BigDecimal.valueOf(amount)
+                .movePointLeft(fractionDigitsOf(currencyCode))
+                .setScale(2, RoundingMode.HALF_UP);
+    }
+
+    private static int fractionDigitsOf(String currencyCode) {
+        int fractionDigits;
+        try {
+            fractionDigits = Currency.getInstance(currencyCode.toUpperCase()).getDefaultFractionDigits();
+        } catch (IllegalArgumentException ex) {
+            fractionDigits = 2;
+        }
+        return fractionDigits < 0 ? 2 : fractionDigits;
+    }
+
     /**
      * Package-private so {@link ReportService} can present the admin ticket list with exactly the
      * same shape (and the same seat resolution) as {@code /api/tickets/me}, instead of growing a
@@ -504,7 +729,29 @@ public class TicketService {
     TicketDto toDto(Ticket ticket) {
         ScheduleDto schedule = scheduleService.getScheduleById(ticket.getScheduleId());
         Map<Long, SeatDto> seats = seatsOfSchedule(ticket.getScheduleId());
-        List<TicketSeatDto> ticketSeats = reservationsOf(ticket).stream()
+        return toDto(ticket, schedule, seats, reservationsOf(ticket));
+    }
+
+    /** Page-level mapping: one reservation query plus one schedule/seat-grid lookup per distinct show. */
+    List<TicketDto> toDtos(List<Ticket> tickets) {
+        if (tickets.isEmpty()) {
+            return List.of();
+        }
+        Map<Long, List<SeatReservationDto>> reservations = seatReservationService.listReservationsOfTickets(
+                tickets.stream().map(Ticket::getId).toList());
+        Map<Long, ScheduleDto> schedules = new HashMap<>();
+        Map<Long, Map<Long, SeatDto>> seatGrids = new HashMap<>();
+        return tickets.stream().map(ticket -> {
+            ScheduleDto schedule = schedules.computeIfAbsent(ticket.getScheduleId(), scheduleService::getScheduleById);
+            Map<Long, SeatDto> seats = seatGrids.computeIfAbsent(schedule.theater().id(),
+                    this::seatsOfTheater);
+            return toDto(ticket, schedule, seats, reservations.getOrDefault(ticket.getId(), List.of()));
+        }).toList();
+    }
+
+    private TicketDto toDto(Ticket ticket, ScheduleDto schedule, Map<Long, SeatDto> seats,
+                            List<SeatReservationDto> reservations) {
+        List<TicketSeatDto> ticketSeats = reservations.stream()
                 .map(reservation -> toSeatDto(reservation, seats.get(reservation.seatId())))
                 .toList();
         return new TicketDto(
@@ -558,8 +805,12 @@ public class TicketService {
     }
 
     private Map<Long, SeatDto> seatsOfSchedule(Long scheduleId) {
+        return seatsOfTheater(scheduleService.getTheaterId(scheduleId));
+    }
+
+    private Map<Long, SeatDto> seatsOfTheater(Long theaterId) {
         Map<Long, SeatDto> seats = new LinkedHashMap<>();
-        for (SeatDto seat : theaterService.listSeats(scheduleService.getTheaterId(scheduleId))) {
+        for (SeatDto seat : theaterService.listSeats(theaterId)) {
             seats.put(seat.id(), seat);
         }
         return seats;

@@ -22,6 +22,10 @@ spring:
     baseline-on-migrate: false
 
 app:
+  security:
+    login-failures: ${AUTH_LOGIN_FAILURES:5}
+    registrations-per-ip: ${AUTH_REGISTRATIONS_PER_IP:120}
+    rate-window-seconds: ${AUTH_RATE_WINDOW_SECONDS:60}
   jwt:
     # Dev-only default; always override JWT_SECRET outside local development.
     # HS256 needs at least 32 bytes - the application fails to start with a shorter secret.
@@ -38,8 +42,11 @@ app:
     # How long a seat hold stays valid. The seat is free again afterwards, lazily (the seat map
     # reports AVAILABLE at once) and eagerly (the sweeper below flips the row to RELEASED).
     hold-minutes: ${RESERVATION_HOLD_MINUTES:10}
-    # Upper bound per hold request, so one client cannot lock a whole hall.
+    # Upper bound per hold request, so one client cannot lock a whole hall with a single call.
     max-seats: ${RESERVATION_MAX_SEATS:10}
+    # Upper bound of active seats (held or paid) one user may occupy in one schedule, so the same
+    # client cannot accumulate the whole hall through many small requests either.
+    max-seats-per-user: ${RESERVATION_MAX_SEATS_PER_USER:8}
     # Interval of the expiry sweeper, in milliseconds.
     sweep-ms: ${RESERVATION_SWEEP_MS:60000}
   # Absolute base URL of this API, used to build the Stripe Checkout success/cancel return URLs.
@@ -60,8 +67,9 @@ app:
     # How long a buyer has to pay a checkout. It is both the Checkout Session's expires_at and the
     # new expiry of the seat holds the ticket was opened for, so the seats can never be swept away
     # while the payment page is still payable. Stripe only accepts 30..1440 minutes and the
-    # application refuses to start with a value outside that range.
-    checkout-minutes: ${TICKET_CHECKOUT_MINUTES:30}
+    # application refuses to start with a value outside that range; the default is 35, not 30,
+    # because the request reaches Stripe a moment after this server computes "now + minutes".
+    checkout-minutes: ${TICKET_CHECKOUT_MINUTES:35}
   admin:
     email: ${ADMIN_EMAIL:admin@cinema.local}
     password: ${ADMIN_PASSWORD:Admin@12345}

@@ -50,4 +50,10 @@ class DisabledPaymentGateway implements PaymentGateway {
         log.warn("Session {} was requested but no payment provider is configured", sessionId);
         throw new ServiceUnavailableException(MESSAGE);
     }
+
+    @Override
+    public void expireCheckoutSession(String sessionId) {
+        // No provider means no hosted page to expire. Cancelling the ticket must still work.
+        log.debug("Session {} does not need expiring: no payment provider is configured", sessionId);
+    }
 }

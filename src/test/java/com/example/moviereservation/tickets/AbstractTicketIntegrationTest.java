@@ -14,6 +14,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -122,11 +123,43 @@ abstract class AbstractTicketIntegrationTest {
      */
     protected String payTicket(long ticketId) throws Exception {
         String paymentIntentId = "pi_test_" + ticketId + "_" + UUID.randomUUID().toString().substring(0, 8);
-        deliver(StripeEvents.checkoutSessionCompleted(
-                        "evt_test_" + UUID.randomUUID(), FakePaymentGateway.sessionIdOf(ticketId),
-                        ticketId, paymentIntentId))
+        deliver(completedEvent(ticketId, paymentIntentId))
                 .andExpect(status().isOk());
         return paymentIntentId;
+    }
+
+    /**
+     * A completed-checkout payload whose amount and currency match the ticket, as a genuine Stripe
+     * event does. Tests that deliberately use a mismatched amount build their own payload.
+     */
+    protected String completedEvent(long ticketId, String paymentIntentId) {
+        return StripeEvents.checkoutSessionCompleted(
+                "evt_test_" + UUID.randomUUID(),
+                FakePaymentGateway.sessionIdOf(ticketId),
+                ticketId,
+                paymentIntentId,
+                ticketTotalMinor(ticketId),
+                ticketCurrency(ticketId));
+    }
+
+    protected String completedEventWithoutPaymentIntent(long ticketId) {
+        return StripeEvents.checkoutSessionCompletedWithoutPaymentIntent(
+                "evt_test_" + UUID.randomUUID(),
+                FakePaymentGateway.sessionIdOf(ticketId),
+                ticketId,
+                ticketTotalMinor(ticketId),
+                ticketCurrency(ticketId));
+    }
+
+    protected long ticketTotalMinor(long ticketId) {
+        BigDecimal total = jdbcTemplate.queryForObject(
+                "SELECT total_price FROM tickets WHERE id = ?", BigDecimal.class, ticketId);
+        return total == null ? 0L : total.movePointRight(2).longValueExact();
+    }
+
+    protected String ticketCurrency(long ticketId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT currency FROM tickets WHERE id = ?", String.class, ticketId);
     }
 
     // --- database assertions -------------------------------------------------------------------

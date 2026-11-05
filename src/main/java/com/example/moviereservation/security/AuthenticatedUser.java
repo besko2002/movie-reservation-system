@@ -7,7 +7,7 @@ package com.example.moviereservation.security;
  * @param email user email
  * @param role  role name without the {@code ROLE_} prefix, e.g. {@code USER}
  */
-public record AuthenticatedUser(Long id, String email, String role) {
+public record AuthenticatedUser(Long id, String email, String role, int tokenVersion) {
 
     /** Spring Security authority derived from the role, e.g. {@code ROLE_ADMIN}. */
     public String authority() {
