@@ -89,17 +89,20 @@ public class SeatReservationService {
 
     private final int holdMinutes;
     private final int maxSeatsPerRequest;
+    private final int maxSeatsPerUser;
 
     public SeatReservationService(SeatReservationRepository reservationRepository,
                                   ScheduleService scheduleService,
                                   TheaterService theaterService,
                                   @Value("${app.reservation.hold-minutes}") int holdMinutes,
-                                  @Value("${app.reservation.max-seats}") int maxSeatsPerRequest) {
+                                  @Value("${app.reservation.max-seats}") int maxSeatsPerRequest,
+                                  @Value("${app.reservation.max-seats-per-user}") int maxSeatsPerUser) {
         this.reservationRepository = reservationRepository;
         this.scheduleService = scheduleService;
         this.theaterService = theaterService;
         this.holdMinutes = holdMinutes;
         this.maxSeatsPerRequest = maxSeatsPerRequest;
+        this.maxSeatsPerUser = maxSeatsPerUser;
     }
 
     /** @return how many minutes a fresh hold is valid */
@@ -110,6 +113,11 @@ public class SeatReservationService {
     /** @return how many seats one request may hold */
     public int getMaxSeatsPerRequest() {
         return maxSeatsPerRequest;
+    }
+
+    /** @return how many active seats one user may hold in one schedule */
+    public int getMaxSeatsPerUser() {
+        return maxSeatsPerUser;
     }
 
     // --- seat map ------------------------------------------------------------------------------
@@ -203,6 +211,20 @@ public class SeatReservationService {
             throw new ConflictException(takenMessage(scheduleId, taken, seatsOfTheater));
         }
 
+        // The per-request limit above stops one huge request; this stops the same user from
+        // accumulating the whole hall through many small ones. Confirmed seats count too: they are
+        // still the same buyer occupying the same showtime.
+        long alreadyActive = reservationRepository
+                .findByUserIdAndScheduleIdAndStatusInOrderByIdAsc(userId, scheduleId, ACTIVE_STATUSES).stream()
+                .filter(reservation -> reservation.isActiveAt(now))
+                .count();
+        if (alreadyActive + seatIds.size() > maxSeatsPerUser) {
+            throw new ConflictException(
+                    ("At most %d seat(s) can be held per user in one schedule; you already have %d, "
+                            + "so %d more cannot be added")
+                            .formatted(maxSeatsPerUser, alreadyActive, seatIds.size()));
+        }
+
         OffsetDateTime expiresAt = now.plusMinutes(holdMinutes);
         SchedulePricesDto prices = scheduleService.getPrices(scheduleId);
         List<SeatReservation> toInsert = requestedSeats.stream()
@@ -285,6 +307,20 @@ public class SeatReservationService {
         return reservationRepository.findByTicketIdOrderByIdAsc(ticketId).stream()
                 .map(SeatReservationDto::from)
                 .toList();
+    }
+
+    /** Fetch the reservations for an entire ticket page in one database query. */
+    @Transactional(readOnly = true)
+    public java.util.Map<Long, List<SeatReservationDto>> listReservationsOfTickets(
+            java.util.Collection<Long> ticketIds) {
+        if (ticketIds.isEmpty()) {
+            return java.util.Map.of();
+        }
+        return reservationRepository.findByTicketIdInOrderByIdAsc(ticketIds).stream()
+                .collect(java.util.stream.Collectors.groupingBy(
+                        reservation -> reservation.getTicketId(),
+                        java.util.stream.Collectors.mapping(SeatReservationDto::from,
+                                java.util.stream.Collectors.toList())));
     }
 
     /**

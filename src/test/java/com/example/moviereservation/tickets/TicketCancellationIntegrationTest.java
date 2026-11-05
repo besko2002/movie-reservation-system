@@ -30,8 +30,34 @@ class TicketCancellationIntegrationTest extends AbstractTicketIntegrationTest {
         assertThat(ticketStatus(ticketId)).isEqualTo("CANCELLED");
         assertThat(reservationStatusesOfUser(user.id(), show.scheduleId())).containsExactly("RELEASED");
         assertThat(fixtures.seatStatus(show.scheduleId(), seatId)).isEqualTo("AVAILABLE");
+        // The hosted page is expired, so the buyer cannot pay a ticket that no longer exists.
+        assertThat(paymentGateway.expiredSessionIds()).containsExactly(FakePaymentGateway.sessionIdOf(ticketId));
         // Nothing was paid, so nothing may be refunded.
         assertThat(paymentGateway.refunds()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("a payment that lands after the pending ticket was cancelled is refunded automatically")
+    void latePaymentAfterCancellationIsRefunded() throws Exception {
+        Show show = fixtures.createShow(fixtures.adminToken());
+        TestUser user = fixtures.registerUser();
+        long ticketId = pendingTicket(user.token(), show.scheduleId(), List.of(show.seat(0)));
+        cancel(user.token(), ticketId).andExpect(status().isNoContent());
+        assertThat(ticketStatus(ticketId)).isEqualTo("CANCELLED");
+
+        // Stripe can deliver a completed event for a page the buyer already had open. The session
+        // was expired above, but the webhook may still arrive and must never keep the money.
+        String paymentIntentId = "pi_test_late_after_cancel";
+        deliver(completedEvent(ticketId, paymentIntentId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.result").value(org.hamcrest.Matchers.containsString("refunded")));
+
+        assertThat(ticketStatus(ticketId)).isEqualTo("REFUNDED");
+        FakePaymentGateway.RecordedRefund refund = paymentGateway.refundOf(paymentIntentId).orElseThrow();
+        assertThat(refund.amount()).isEqualByComparingTo("25.00");
+        assertThat(refund.idempotencyKey()).isEqualTo("ticket-" + ticketId + "-refund");
+        assertThat(paymentGateway.refunds()).hasSize(1);
+        assertThat(reservationStatusesOfTicket(ticketId)).containsExactly("RELEASED");
     }
 
     @Test
@@ -47,10 +73,10 @@ class TicketCancellationIntegrationTest extends AbstractTicketIntegrationTest {
         cancel(user.token(), ticketId).andExpect(status().isNoContent());
 
         assertThat(ticketStatus(ticketId)).isEqualTo("REFUNDED");
-        assertThat(paymentGateway.refundOf(paymentIntentId)).isPresent()
-                .get()
-                .extracting(FakePaymentGateway.RecordedRefund::amount)
-                .satisfies(amount -> assertThat(amount).isEqualByComparingTo("35.00"));
+        FakePaymentGateway.RecordedRefund refund = paymentGateway.refundOf(paymentIntentId).orElseThrow();
+        assertThat(refund.amount()).isEqualByComparingTo("35.00");
+        // A stable key makes a retried refund after a failed commit return the same Stripe refund.
+        assertThat(refund.idempotencyKey()).isEqualTo("ticket-" + ticketId + "-refund");
         assertThat(reservationStatusesOfTicket(ticketId)).containsExactly("RELEASED", "RELEASED");
         assertThat(fixtures.seatStatus(show.scheduleId(), show.seat(0))).isEqualTo("AVAILABLE");
     }

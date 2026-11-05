@@ -5,6 +5,7 @@ import com.stripe.StripeClient;
 import com.stripe.exception.StripeException;
 import com.stripe.model.Refund;
 import com.stripe.model.checkout.Session;
+import com.stripe.net.RequestOptions;
 import com.stripe.param.RefundCreateParams;
 import com.stripe.param.checkout.SessionCreateParams;
 import org.slf4j.Logger;
@@ -58,8 +59,11 @@ class StripePaymentGateway implements PaymentGateway {
     public PaymentSessionDto createCheckoutSession(CheckoutSessionRequest request) {
         SessionCreateParams.Builder params = SessionCreateParams.builder()
                 .setMode(SessionCreateParams.Mode.PAYMENT)
-                .setSuccessUrl(baseUrl + "/api/tickets/" + request.ticketId() + "?payment=success")
-                .setCancelUrl(baseUrl + "/api/tickets/" + request.ticketId() + "?payment=cancelled")
+                .setSuccessUrl(baseUrl + "/payment/success")
+                .setCancelUrl(baseUrl + "/payment/cancel")
+                .setPaymentIntentData(SessionCreateParams.PaymentIntentData.builder()
+                        .putMetadata("ticketId", String.valueOf(request.ticketId()))
+                        .build())
                 // Travels back on every event of this session, so the webhook can find the ticket
                 // even when the metadata is lost.
                 .setClientReferenceId(String.valueOf(request.ticketId()))
@@ -103,18 +107,40 @@ class StripePaymentGateway implements PaymentGateway {
 
     @Override
     public RefundDto refund(String paymentIntentId, BigDecimal amount) {
+        return refund(paymentIntentId, amount, null);
+    }
+
+    @Override
+    public RefundDto refund(String paymentIntentId, BigDecimal amount, String idempotencyKey) {
         try {
-            Refund refund = client.refunds().create(RefundCreateParams.builder()
+            RefundCreateParams params = RefundCreateParams.builder()
                     .setPaymentIntent(paymentIntentId)
                     .setAmount(toMinorUnits(amount))
-                    .build());
-            log.info("Created Stripe refund {} of {} {} for payment intent {}",
-                    refund.getId(), amount, currency, paymentIntentId);
+                    .build();
+            Refund refund = idempotencyKey == null || idempotencyKey.isBlank()
+                    ? client.refunds().create(params)
+                    : client.refunds().create(params, RequestOptions.builder()
+                            .setIdempotencyKey(idempotencyKey)
+                            .build());
+            log.info("Created Stripe refund {} of {} {} for payment intent {} (idempotencyKey={})",
+                    refund.getId(), amount, currency, paymentIntentId, idempotencyKey);
             return new RefundDto(refund.getId(), paymentIntentId, amount, refund.getStatus());
         } catch (StripeException ex) {
             log.error("Stripe refused to refund payment intent {}", paymentIntentId, ex);
             throw new ServiceUnavailableException(
                     "The payment provider could not process the refund right now; please try again");
+        }
+    }
+
+    @Override
+    public void expireCheckoutSession(String sessionId) {
+        try {
+            Session session = client.checkout().sessions().expire(sessionId);
+            log.info("Expired Stripe Checkout Session {} (status {})", sessionId, session.getStatus());
+        } catch (StripeException ex) {
+            log.error("Stripe refused to expire Checkout Session {}", sessionId, ex);
+            throw new ServiceUnavailableException(
+                    "The payment provider could not expire the checkout session right now; please try again");
         }
     }
 

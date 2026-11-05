@@ -12,8 +12,15 @@ import org.springframework.beans.factory.annotation.Value;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
@@ -121,6 +128,80 @@ class TicketCheckoutIntegrationTest extends AbstractTicketIntegrationTest {
         // Exactly one ticket and exactly one payment page were ever created.
         assertThat(ticketCount(user.id(), show.scheduleId())).isEqualTo(1);
         assertThat(paymentGateway.checkoutSessionCount()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("simultaneous checkouts for one user and schedule create exactly one ticket and session")
+    void concurrentCheckoutsCreateExactlyOneTicket() throws Exception {
+        Show show = fixtures.createShow(fixtures.adminToken());
+        TestUser user = fixtures.registerUser();
+        fixtures.holdSeats(user.token(), show.scheduleId(), List.of(show.seat(0), show.seat(1)));
+
+        int threads = 6;
+        CountDownLatch ready = new CountDownLatch(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threads);
+        AtomicInteger created = new AtomicInteger();
+        AtomicInteger existing = new AtomicInteger();
+        ConcurrentLinkedQueue<Throwable> unexpected = new ConcurrentLinkedQueue<>();
+
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try {
+            for (int index = 0; index < threads; index++) {
+                pool.submit(() -> {
+                    ready.countDown();
+                    try {
+                        start.await();
+                        int status = mockMvc.perform(post("/api/tickets")
+                                        .header("Authorization", TicketApiFixtures.bearer(user.token()))
+                                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                                        .content("""
+                                                {"scheduleId":%d}""".formatted(show.scheduleId())))
+                                .andReturn().getResponse().getStatus();
+                        if (status == 201) {
+                            created.incrementAndGet();
+                        } else if (status == 200) {
+                            existing.incrementAndGet();
+                        } else {
+                            unexpected.add(new AssertionError("unexpected checkout status " + status));
+                        }
+                    } catch (Throwable throwable) {
+                        unexpected.add(throwable);
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+            assertThat(ready.await(30, TimeUnit.SECONDS)).isTrue();
+            start.countDown();
+            assertThat(done.await(60, TimeUnit.SECONDS)).isTrue();
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertThat(unexpected).isEmpty();
+        assertThat(created.get()).isEqualTo(1);
+        assertThat(existing.get()).isEqualTo(threads - 1);
+        assertThat(ticketCount(user.id(), show.scheduleId())).isEqualTo(1);
+        assertThat(paymentGateway.checkoutSessionCount()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("checkout of a showtime that has already started is a 409")
+    void checkoutAfterShowStartIsConflict() throws Exception {
+        Show show = fixtures.createShow(fixtures.adminToken());
+        TestUser user = fixtures.registerUser();
+        fixtures.holdSeats(user.token(), show.scheduleId(), List.of(show.seat(0)));
+
+        // A schedule cannot be created in the past, so an existing one is moved there directly.
+        OffsetDateTime start = OffsetDateTime.now(ZoneOffset.UTC).minusHours(1);
+        jdbcTemplate.update("update movie_schedules set start_time = ?, end_time = ? where id = ?",
+                start, start.plusHours(2), show.scheduleId());
+
+        postCheckout(user.token(), show.scheduleId())
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("already started")));
+        assertThat(ticketCount(user.id(), show.scheduleId())).isZero();
     }
 
     @Test

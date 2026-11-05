@@ -99,6 +99,12 @@ public class Ticket {
         }
     }
 
+    void recordCapturedAt(OffsetDateTime capturedAt) {
+        if (paidAt == null) {
+            paidAt = capturedAt;
+        }
+    }
+
     void markCancelled(OffsetDateTime cancelledAt) {
         this.status = TicketStatus.CANCELLED;
         this.cancelledAt = cancelledAt;

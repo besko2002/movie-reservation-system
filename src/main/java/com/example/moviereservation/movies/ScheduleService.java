@@ -279,6 +279,7 @@ public class ScheduleService {
             throw new BadRequestException("startTime must be in the future, but was " + format(start));
         }
         OffsetDateTime end = endTimeOf(start, movie.getDurationMinutes());
+        scheduleRepository.lockTheaterSchedule(theater.id());
         requireNoOverlap(theater.id(), start, end, NO_EXCLUDED_ID);
 
         MovieSchedule schedule = scheduleRepository.saveAndFlush(new MovieSchedule(
@@ -314,6 +315,7 @@ public class ScheduleService {
             scheduleUsagePolicy.ifAvailable(policy -> policy.checkScheduleMayBeMoved(id));
         }
         OffsetDateTime end = endTimeOf(start, movie.getDurationMinutes());
+        scheduleRepository.lockTheaterSchedule(theater.id());
         requireNoOverlap(theater.id(), start, end, id);
 
         schedule.setMovie(movie);
@@ -336,13 +338,20 @@ public class ScheduleService {
     @Transactional
     void applyMovieDuration(Long movieId, int durationMinutes) {
         List<MovieSchedule> schedules = scheduleRepository.findByMovie_Id(movieId);
+        // Acquire locks in a stable order when a movie plays in several theaters.
+        schedules.stream().map(MovieSchedule::getTheaterId).distinct().sorted()
+                .forEach(scheduleRepository::lockTheaterSchedule);
+        for (MovieSchedule schedule : schedules) {
+            // Validate against the old windows before changing a managed entity: a JPQL overlap
+            // read may auto-flush pending changes, which would trip the DB exclusion constraint
+            // before we can return the intended 409 with a useful conflict description.
+            requireNoOverlap(schedule.getTheaterId(), schedule.getStartTime(),
+                    endTimeOf(schedule.getStartTime(), durationMinutes), schedule.getId());
+        }
         for (MovieSchedule schedule : schedules) {
             schedule.setEndTime(endTimeOf(schedule.getStartTime(), durationMinutes));
         }
         scheduleRepository.flush();
-        for (MovieSchedule schedule : schedules) {
-            requireNoOverlap(schedule.getTheaterId(), schedule.getStartTime(), schedule.getEndTime(), schedule.getId());
-        }
     }
 
     /**

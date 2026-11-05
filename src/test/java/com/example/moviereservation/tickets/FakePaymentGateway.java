@@ -31,12 +31,13 @@ class FakePaymentGateway implements PaymentGateway {
     static final String CHECKOUT_URL_PREFIX = "https://checkout.test.invalid/pay/";
 
     /** One refund the production code asked for. */
-    record RecordedRefund(String paymentIntentId, BigDecimal amount) {
+    record RecordedRefund(String paymentIntentId, BigDecimal amount, String idempotencyKey) {
     }
 
     private final Map<String, PaymentSessionDto> sessionsById = new ConcurrentHashMap<>();
     private final List<CheckoutSessionRequest> checkoutRequests = new ArrayList<>();
     private final List<RecordedRefund> refunds = new ArrayList<>();
+    private final List<String> expiredSessions = new ArrayList<>();
 
     @Override
     public boolean isEnabled() {
@@ -69,9 +70,20 @@ class FakePaymentGateway implements PaymentGateway {
     }
 
     @Override
-    public synchronized RefundDto refund(String paymentIntentId, BigDecimal amount) {
-        refunds.add(new RecordedRefund(paymentIntentId, amount));
+    public RefundDto refund(String paymentIntentId, BigDecimal amount) {
+        return refund(paymentIntentId, amount, null);
+    }
+
+    @Override
+    public synchronized RefundDto refund(String paymentIntentId, BigDecimal amount, String idempotencyKey) {
+        refunds.add(new RecordedRefund(paymentIntentId, amount, idempotencyKey));
         return new RefundDto("re_test_fake_" + refunds.size(), paymentIntentId, amount, "succeeded");
+    }
+
+    @Override
+    public synchronized void expireCheckoutSession(String sessionId) {
+        expiredSessions.add(sessionId);
+        sessionsById.remove(sessionId);
     }
 
     // --- test inspection ---------------------------------------------------------------------
@@ -80,10 +92,15 @@ class FakePaymentGateway implements PaymentGateway {
         sessionsById.clear();
         checkoutRequests.clear();
         refunds.clear();
+        expiredSessions.clear();
     }
 
     synchronized List<RecordedRefund> refunds() {
         return List.copyOf(refunds);
+    }
+
+    synchronized List<String> expiredSessionIds() {
+        return List.copyOf(expiredSessions);
     }
 
     /** @return the refund recorded for that payment intent, if the code asked for one */

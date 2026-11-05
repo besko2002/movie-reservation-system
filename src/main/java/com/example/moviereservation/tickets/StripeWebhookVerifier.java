@@ -173,8 +173,8 @@ public class StripeWebhookVerifier {
      * Reads the handful of fields this module acts on out of the event JSON with Jackson.
      *
      * <p>Deliberately not {@code Event.GSON}/{@code StripeObject} deserialisation: the payload is
-     * already verified and only five values are needed, so the module stays independent of the
-     * SDK's model classes and the tests can post a hand written event.
+     * already verified and only a handful of fields are needed, so the module stays independent of
+     * the SDK's model classes and the tests can post a hand written event.
      */
     private PaymentEvent parse(String payload) {
         JsonNode root;
@@ -204,12 +204,27 @@ public class StripeWebhookVerifier {
         if (ticketId == null) {
             ticketId = parseTicketId(text(object.path("metadata"), "ticketId"));
         }
-        return new PaymentEvent(id, type, sessionId, paymentIntentId, ticketId);
+        return new PaymentEvent(
+                id,
+                type,
+                sessionId,
+                paymentIntentId,
+                ticketId,
+                text(object, "payment_status"),
+                longValue(object, "amount_total"),
+                text(object, "currency"),
+                longValue(object, "amount"),
+                longValue(object, "amount_refunded"));
     }
 
     private static String text(JsonNode node, String field) {
         JsonNode value = node.path(field);
         return value.isTextual() && !value.asText().isBlank() ? value.asText() : null;
+    }
+
+    private static Long longValue(JsonNode node, String field) {
+        JsonNode value = node.path(field);
+        return value.isIntegralNumber() && value.canConvertToLong() ? value.asLong() : null;
     }
 
     private static Long parseTicketId(String value) {

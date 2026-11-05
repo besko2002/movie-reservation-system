@@ -17,6 +17,10 @@ import java.util.Optional;
 interface MovieScheduleRepository extends JpaRepository<MovieSchedule, Long>,
         JpaSpecificationExecutor<MovieSchedule> {
 
+    /** Serialize overlap checks and writes for a theater within the current transaction. */
+    @Query(value = "select pg_advisory_xact_lock(:theaterId + 72057594037927936)", nativeQuery = true)
+    void lockTheaterSchedule(@Param("theaterId") Long theaterId);
+
     /** Loads a schedule together with its movie, so the detail DTO needs no second query. */
     @EntityGraph(attributePaths = "movie")
     Optional<MovieSchedule> findWithMovieById(Long id);

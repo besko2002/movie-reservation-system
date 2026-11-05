@@ -1,6 +1,7 @@
 package com.example.moviereservation.security;
 
 import jakarta.servlet.FilterChain;
+import com.example.moviereservation.users.TokenAccountValidator;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -28,9 +29,11 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     private static final String BEARER_PREFIX = "Bearer ";
 
     private final JwtService jwtService;
+    private final TokenAccountValidator accountValidator;
 
-    public JwtAuthenticationFilter(JwtService jwtService) {
+    public JwtAuthenticationFilter(JwtService jwtService, TokenAccountValidator accountValidator) {
         this.jwtService = jwtService;
+        this.accountValidator = accountValidator;
     }
 
     @Override
@@ -42,6 +45,9 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                 && SecurityContextHolder.getContext().getAuthentication() == null) {
             String token = header.substring(BEARER_PREFIX.length()).trim();
             jwtService.parseToken(token).ifPresent(principal -> {
+                if (!accountValidator.isCurrent(principal)) {
+                    return;
+                }
                 var authentication = new UsernamePasswordAuthenticationToken(
                         principal, null, List.of(new SimpleGrantedAuthority(principal.authority())));
                 authentication.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));

@@ -1,8 +1,12 @@
 package com.example.moviereservation.tickets;
 
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.repository.query.Param;
 
 import java.math.BigDecimal;
@@ -21,7 +25,7 @@ import java.util.Optional;
 interface TicketRepository extends JpaRepository<Ticket, Long>, JpaSpecificationExecutor<Ticket> {
 
     /** "My tickets", newest first. */
-    List<Ticket> findByUserIdOrderByIdDesc(Long userId);
+    Page<Ticket> findByUserId(Long userId, Pageable pageable);
 
     /** The checkout idempotency lookup: does this user already wait for a payment here? */
     Optional<Ticket> findFirstByUserIdAndScheduleIdAndStatusOrderByIdDesc(Long userId,
@@ -34,27 +38,57 @@ interface TicketRepository extends JpaRepository<Ticket, Long>, JpaSpecification
     /** Webhook fallback for {@code charge.refunded} / {@code payment_intent.payment_failed}. */
     List<Ticket> findByStripePaymentIntentIdOrderByIdDesc(String stripePaymentIntentId);
 
-    // --- reports (phase 8) ---------------------------------------------------------------------
+    /**
+     * Locks the ticket row for the duration of the current transaction. Every state transition uses
+     * this instead of a plain read, so two deliveries (or a delivery racing a cancellation) cannot
+     * both act on the same stale status — the second one waits and then sees the first one's result.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select t from Ticket t where t.id = :id")
+    Optional<Ticket> findByIdForUpdate(@Param("id") Long id);
+
+    /** Locked variant of {@link #findByStripeSessionId(String)} for the webhook fallback path. */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select t from Ticket t where t.stripeSessionId = :stripeSessionId")
+    Optional<Ticket> findByStripeSessionIdForUpdate(@Param("stripeSessionId") String stripeSessionId);
+
+    /** Locked variant of {@link #findByStripePaymentIntentIdOrderByIdDesc(String)}. */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select t from Ticket t where t.stripePaymentIntentId = :paymentIntentId order by t.id desc")
+    List<Ticket> findByStripePaymentIntentIdForUpdate(@Param("paymentIntentId") String paymentIntentId);
 
     /**
-     * Count and money of one status inside a {@code paid_at} window — the single query behind both
-     * "what came in" (status PAID) and "what was given back" (status REFUNDED).
+     * Serializes concurrent checkouts for one (user, schedule) pair. The lock is transaction-scoped,
+     * so the second request waits until the first has committed its pending ticket and then sees it
+     * in the idempotency lookup instead of creating a second ticket and a second Stripe session.
      *
-     * @param status ticket status to add up
-     * @param from   inclusive lower bound of {@code paid_at}
-     * @param to     exclusive upper bound of {@code paid_at}
-     * @return the aggregate; its {@code amount} is {@code null} when nothing matched
+     * <p>The key is derived in {@link TicketService}; a collision only over-serializes two unrelated
+     * checkouts, never leaks state between them.
      */
+    @Query(value = "select pg_advisory_xact_lock(:key)", nativeQuery = true)
+    void lockCheckoutPair(@Param("key") long key);
+
+    // --- reports (phase 8) ---------------------------------------------------------------------
+
+    /** All captured tickets in the paid-at window, including ones refunded later. */
     @Query("""
             select new com.example.moviereservation.tickets.RevenueTotals(count(t), sum(t.totalPrice))
               from Ticket t
-             where t.status = :status
-               and t.paidAt >= :from
+             where t.paidAt >= :from
                and t.paidAt < :to
             """)
-    RevenueTotals totalsForStatusInPaidWindow(@Param("status") TicketStatus status,
-                                             @Param("from") OffsetDateTime from,
-                                             @Param("to") OffsetDateTime to);
+    RevenueTotals totalsInPaidWindow(@Param("from") OffsetDateTime from,
+                                     @Param("to") OffsetDateTime to);
+
+    /** Never add amounts of different currencies, even after a deployment changes its default. */
+    @Query("""
+            select distinct t.currency from Ticket t
+             where (t.paidAt >= :from and t.paidAt < :to)
+                or exists (select r.id from TicketRefund r where r.ticketId = t.id
+                            and r.occurredAt >= :from and r.occurredAt < :to)
+            """)
+    List<String> currenciesInReportWindow(@Param("from") OffsetDateTime from,
+                                          @Param("to") OffsetDateTime to);
 
     /**
      * Revenue grouped per schedule inside a {@code paid_at} window. The caller turns the schedules
@@ -65,14 +99,12 @@ interface TicketRepository extends JpaRepository<Ticket, Long>, JpaSpecification
             select new com.example.moviereservation.tickets.ScheduleRevenueRow(
                      t.scheduleId, count(t), sum(t.totalPrice))
               from Ticket t
-             where t.status = :status
-               and t.paidAt >= :from
+             where t.paidAt >= :from
                and t.paidAt < :to
              group by t.scheduleId
              order by t.scheduleId
             """)
-    List<ScheduleRevenueRow> revenueByScheduleInPaidWindow(@Param("status") TicketStatus status,
-                                                           @Param("from") OffsetDateTime from,
+    List<ScheduleRevenueRow> revenueByScheduleInPaidWindow(@Param("from") OffsetDateTime from,
                                                            @Param("to") OffsetDateTime to);
 
     /**
@@ -80,8 +112,7 @@ interface TicketRepository extends JpaRepository<Ticket, Long>, JpaSpecification
      *
      * <p>Native SQL on purpose: only the database can turn a {@code TIMESTAMPTZ} into "the local day
      * in that zone" ({@code paid_at AT TIME ZONE :zone}), and grouping there keeps the whole daily
-     * series a single round trip. {@code status} is bound as text because {@code tickets.status} is a
-     * {@code VARCHAR} column with a {@code CHECK} constraint.
+     * series a single round trip.
      *
      * @return rows of {@code [day, tickets, revenue]}, oldest day first
      */
@@ -90,14 +121,12 @@ interface TicketRepository extends JpaRepository<Ticket, Long>, JpaSpecification
                    count(*) as tickets,
                    sum(t.total_price) as revenue
               from tickets t
-             where t.status = :status
-               and t.paid_at >= :from
+             where t.paid_at >= :from
                and t.paid_at < :to
              group by 1
              order by 1
             """, nativeQuery = true)
-    List<Object[]> revenueByDayInPaidWindow(@Param("status") String status,
-                                            @Param("zone") String zone,
+    List<Object[]> revenueByDayInPaidWindow(@Param("zone") String zone,
                                             @Param("from") OffsetDateTime from,
                                             @Param("to") OffsetDateTime to);
 

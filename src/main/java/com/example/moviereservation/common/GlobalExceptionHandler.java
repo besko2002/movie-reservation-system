@@ -55,6 +55,11 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.UNAUTHORIZED, ex.getMessage(), request);
     }
 
+    @ExceptionHandler(TooManyRequestsException.class)
+    public ResponseEntity<ApiError> handleRateLimit(TooManyRequestsException ex, HttpServletRequest request) {
+        return build(HttpStatus.TOO_MANY_REQUESTS, ex.getMessage(), request);
+    }
+
     /**
      * Method-security failures ({@code @PreAuthorize}) are rethrown so Spring Security's
      * {@code ExceptionTranslationFilter} answers them with 401 or 403 through the security handlers,

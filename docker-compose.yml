@@ -12,7 +12,7 @@ services:
       # A local (Homebrew) PostgreSQL 16 already listens on 127.0.0.1:5433, and a specific
       # loopback bind wins over Docker's wildcard bind, so mapping 5433 would silently route
       # clients to that local server. 5432 is left free for the conventional local default.
-      - "5434:5432"
+      - "127.0.0.1:5434:5432"
     volumes:
       - movie_reservation_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -59,11 +59,12 @@ services:
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_CURRENCY: ${STRIPE_CURRENCY:-usd}
       TICKET_CANCELLATION_CUTOFF_HOURS: ${TICKET_CANCELLATION_CUTOFF_HOURS:-2}
-      TICKET_CHECKOUT_MINUTES: ${TICKET_CHECKOUT_MINUTES:-30}
+      TICKET_CHECKOUT_MINUTES: ${TICKET_CHECKOUT_MINUTES:-35}
       SCHEDULE_BUFFER_MINUTES: ${SCHEDULE_BUFFER_MINUTES:-15}
       SCHEDULE_ZONE: ${SCHEDULE_ZONE:-UTC}
       RESERVATION_HOLD_MINUTES: ${RESERVATION_HOLD_MINUTES:-10}
       RESERVATION_MAX_SEATS: ${RESERVATION_MAX_SEATS:-10}
+      RESERVATION_MAX_SEATS_PER_USER: ${RESERVATION_MAX_SEATS_PER_USER:-8}
       RESERVATION_SWEEP_MS: ${RESERVATION_SWEEP_MS:-60000}
       APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8080}
     ports:

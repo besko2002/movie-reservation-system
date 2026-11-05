@@ -1,6 +1,7 @@
 package com.example.moviereservation.tickets;
 
 import com.example.moviereservation.common.ApiError;
+import com.example.moviereservation.common.PageResponse;
 import com.example.moviereservation.security.AuthenticatedUser;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.media.Content;
@@ -18,12 +19,12 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 import java.net.URI;
-import java.util.List;
 
 /**
  * Tickets: check out the seats you hold, look at your tickets, cancel one.
@@ -71,7 +72,8 @@ public class TicketController {
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @ApiResponse(responseCode = "404", description = "Unknown schedule",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
-            @ApiResponse(responseCode = "409", description = "The caller holds no seat in that schedule",
+            @ApiResponse(responseCode = "409",
+                    description = "The caller holds no seat in that schedule, or the showtime already started",
                     content = @Content(schema = @Schema(implementation = ApiError.class))),
             @ApiResponse(responseCode = "503", description = "No payment provider is configured or reachable",
                     content = @Content(schema = @Schema(implementation = ApiError.class)))
@@ -94,14 +96,16 @@ public class TicketController {
     @GetMapping("/me")
     @PreAuthorize("isAuthenticated()")
     @Operation(summary = "The caller's tickets, newest first (USER)",
-            description = "Every ticket of the token owner with its seats, whatever its status.")
+             description = "A bounded page of the token owner's tickets with seats, newest first.")
     @ApiResponses({
             @ApiResponse(responseCode = "200", description = "Tickets of the token owner"),
             @ApiResponse(responseCode = "401", description = "Missing or invalid token",
                     content = @Content(schema = @Schema(implementation = ApiError.class)))
     })
-    public List<TicketDto> mine(@AuthenticationPrincipal AuthenticatedUser principal) {
-        return ticketService.listMyTickets(principal.id());
+    public PageResponse<TicketDto> mine(@AuthenticationPrincipal AuthenticatedUser principal,
+                                        @RequestParam(required = false) Integer page,
+                                        @RequestParam(required = false) Integer size) {
+        return ticketService.listMyTickets(principal.id(), page, size);
     }
 
     @GetMapping("/{id}")

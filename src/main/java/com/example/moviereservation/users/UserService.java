@@ -77,7 +77,7 @@ public class UserService {
         String hash = user.map(User::getPasswordHash).orElse(dummyPasswordHash);
         boolean passwordMatches = !exceedsBcryptLimit(request.password())
                 && passwordEncoder.matches(request.password(), hash);
-        if (user.isEmpty() || !passwordMatches) {
+        if (user.isEmpty() || !passwordMatches || !user.get().isEnabled()) {
             throw new BadCredentialsException(INVALID_CREDENTIALS);
         }
         return issueToken(user.get());
@@ -95,6 +95,12 @@ public class UserService {
     @Transactional(readOnly = true)
     public Optional<UserDto> findByEmail(String email) {
         return userRepository.findByEmail(normaliseEmail(email)).map(UserDto::from);
+    }
+
+    /** Invalidate every outstanding access token for this account, including this request's. */
+    @Transactional
+    public void logoutEverywhere(Long userId) {
+        userRepository.revokeTokens(userId);
     }
 
     /**
@@ -119,7 +125,8 @@ public class UserService {
     }
 
     private AuthResponse issueToken(User user) {
-        String token = jwtService.generateToken(user.getId(), user.getEmail(), user.getRole().name());
+        String token = jwtService.generateToken(user.getId(), user.getEmail(), user.getRole().name(),
+                user.getTokenVersion());
         return AuthResponse.of(token, jwtService.getExpirationSeconds(), UserDto.from(user));
     }
 

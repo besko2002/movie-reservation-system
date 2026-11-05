@@ -35,15 +35,16 @@ class TicketReadIntegrationTest extends AbstractTicketIntegrationTest {
                 .andExpect(status().isOk())
                 .andReturn().getResponse().getContentAsString());
 
-        assertThat(mine.isArray()).isTrue();
-        assertThat(mine).hasSize(2);
-        assertThat(mine.get(0).path("id").asLong()).isEqualTo(newerTicket);
-        assertThat(mine.get(1).path("id").asLong()).isEqualTo(olderTicket);
-        assertThat(mine.get(0).path("id").asLong()).isNotEqualTo(foreignTicket);
-        assertThat(mine.get(1).path("id").asLong()).isNotEqualTo(foreignTicket);
+        assertThat(mine.path("totalElements").asLong()).isEqualTo(2);
+        assertThat(mine.path("size").asInt()).isEqualTo(20);
+        assertThat(mine.path("content")).hasSize(2);
+        assertThat(mine.path("content").get(0).path("id").asLong()).isEqualTo(newerTicket);
+        assertThat(mine.path("content").get(1).path("id").asLong()).isEqualTo(olderTicket);
+        assertThat(mine.path("content").get(0).path("id").asLong()).isNotEqualTo(foreignTicket);
+        assertThat(mine.path("content").get(1).path("id").asLong()).isNotEqualTo(foreignTicket);
 
         // Seats travel with the ticket, with their labels and prices.
-        JsonNode newest = mine.get(0);
+        JsonNode newest = mine.path("content").get(0);
         assertThat(newest.path("seatCount").asInt()).isEqualTo(2);
         assertThat(newest.path("seats")).hasSize(2);
         assertThat(newest.path("seats").get(0).path("rowLabel").asText()).isEqualTo("B");
@@ -54,15 +55,40 @@ class TicketReadIntegrationTest extends AbstractTicketIntegrationTest {
     }
 
     @Test
-    @DisplayName("/me is an empty array for a user who never bought anything")
+    @DisplayName("/me is an empty page for a user who never bought anything")
     void meIsEmptyForNewUser() throws Exception {
         TestUser user = fixtures.registerUser();
 
         mockMvc.perform(get("/api/tickets/me")
                         .header("Authorization", TicketApiFixtures.bearer(user.token())))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$").isArray())
-                .andExpect(jsonPath("$").isEmpty());
+                .andExpect(jsonPath("$.content").isEmpty())
+                .andExpect(jsonPath("$.totalElements").value(0));
+    }
+
+    @Test
+    void myTicketsClampsPageSizeAndKeepsNewestFirstAcrossPages() throws Exception {
+        String adminToken = fixtures.adminToken();
+        Show first = fixtures.createShow(adminToken);
+        Show second = fixtures.createShow(adminToken);
+        TestUser user = fixtures.registerUser();
+        long older = pendingTicket(user.token(), first.scheduleId(), List.of(first.seat(0)));
+        long newer = pendingTicket(user.token(), second.scheduleId(), List.of(second.seat(0)));
+
+        mockMvc.perform(get("/api/tickets/me").param("size", "1").param("page", "0")
+                        .header("Authorization", TicketApiFixtures.bearer(user.token())))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content[0].id").value(newer))
+                .andExpect(jsonPath("$.totalPages").value(2));
+        mockMvc.perform(get("/api/tickets/me").param("size", "1").param("page", "1")
+                        .header("Authorization", TicketApiFixtures.bearer(user.token())))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content[0].id").value(older))
+                .andExpect(jsonPath("$.last").value(true));
+        mockMvc.perform(get("/api/tickets/me").param("size", "10000")
+                        .header("Authorization", TicketApiFixtures.bearer(user.token())))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.size").value(100));
     }
 
     @Test

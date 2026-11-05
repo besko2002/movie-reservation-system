@@ -99,15 +99,15 @@ class PaymentsDisabledIntegrationTest {
     }
 
     @Test
-    @DisplayName("the read endpoints keep working: /me is an empty array")
+    @DisplayName("the read endpoints keep working: /me is an empty page")
     void readEndpointsKeepWorking() throws Exception {
         TestUser user = fixtures.registerUser();
 
         mockMvc.perform(get("/api/tickets/me")
                         .header("Authorization", TicketApiFixtures.bearer(user.token())))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$").isArray())
-                .andExpect(jsonPath("$").isEmpty());
+                .andExpect(jsonPath("$.content").isEmpty())
+                .andExpect(jsonPath("$.totalElements").value(0));
     }
 
     @Test

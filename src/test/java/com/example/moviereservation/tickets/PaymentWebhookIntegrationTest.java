@@ -7,7 +7,6 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
 import java.util.List;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -29,9 +28,7 @@ class PaymentWebhookIntegrationTest extends AbstractTicketIntegrationTest {
         TestUser user = fixtures.registerUser();
         long ticketId = pendingTicket(user.token(), show.scheduleId(),
                 List.of(show.seat(0), show.seat(3)));
-        String payload = StripeEvents.checkoutSessionCompleted(
-                "evt_test_" + UUID.randomUUID(), FakePaymentGateway.sessionIdOf(ticketId),
-                ticketId, "pi_test_completed_1");
+        String payload = completedEvent(ticketId, "pi_test_completed_1");
 
         deliver(payload)
                 .andExpect(status().isOk())
@@ -51,8 +48,7 @@ class PaymentWebhookIntegrationTest extends AbstractTicketIntegrationTest {
         Show show = fixtures.createShow(fixtures.adminToken());
         TestUser user = fixtures.registerUser();
         long ticketId = pendingTicket(user.token(), show.scheduleId(), List.of(show.seat(1)));
-        String payload = StripeEvents.checkoutSessionCompleted(
-                "evt_test_redelivery", FakePaymentGateway.sessionIdOf(ticketId), ticketId, "pi_test_redelivery");
+        String payload = completedEvent(ticketId, "pi_test_redelivery");
 
         deliver(payload).andExpect(status().isOk());
         String paidAtAfterFirst = paidAtText(ticketId);
@@ -74,10 +70,10 @@ class PaymentWebhookIntegrationTest extends AbstractTicketIntegrationTest {
         Show show = fixtures.createShow(fixtures.adminToken());
         TestUser user = fixtures.registerUser();
         long ticketId = pendingTicket(user.token(), show.scheduleId(), List.of(show.seat(2)));
-        String signed = StripeEvents.checkoutSessionCompleted(
-                "evt_test_tampered", FakePaymentGateway.sessionIdOf(ticketId), ticketId, "pi_test_tampered");
+        String signed = completedEvent(ticketId, "pi_test_tampered");
         // The attacker keeps the genuine signature but edits the body it was computed over.
-        String tampered = signed.replace("\"amount_total\":3500", "\"amount_total\":1");
+        String tampered = signed.replace(
+                "\"amount_total\":" + ticketTotalMinor(ticketId), "\"amount_total\":1");
 
         deliver(tampered, StripeSignatures.tamperedFor(signed, WEBHOOK_SECRET))
                 .andExpect(status().isBadRequest())
@@ -95,8 +91,7 @@ class PaymentWebhookIntegrationTest extends AbstractTicketIntegrationTest {
         Show show = fixtures.createShow(fixtures.adminToken());
         TestUser user = fixtures.registerUser();
         long ticketId = pendingTicket(user.token(), show.scheduleId(), List.of(show.seat(0)));
-        String payload = StripeEvents.checkoutSessionCompleted(
-                "evt_test_nosig", FakePaymentGateway.sessionIdOf(ticketId), ticketId, "pi_test_nosig");
+        String payload = completedEvent(ticketId, "pi_test_nosig");
 
         deliver(payload, null)
                 .andExpect(status().isBadRequest())
@@ -111,8 +106,7 @@ class PaymentWebhookIntegrationTest extends AbstractTicketIntegrationTest {
         Show show = fixtures.createShow(fixtures.adminToken());
         TestUser user = fixtures.registerUser();
         long ticketId = pendingTicket(user.token(), show.scheduleId(), List.of(show.seat(0)));
-        String payload = StripeEvents.checkoutSessionCompleted(
-                "evt_test_wrongsig", FakePaymentGateway.sessionIdOf(ticketId), ticketId, "pi_test_wrongsig");
+        String payload = completedEvent(ticketId, "pi_test_wrongsig");
 
         deliver(payload, StripeSignatures.wrongSignature())
                 .andExpect(status().isBadRequest());
@@ -159,8 +153,8 @@ class PaymentWebhookIntegrationTest extends AbstractTicketIntegrationTest {
     }
 
     @Test
-    @DisplayName("payment_intent.payment_failed cancels the ticket and frees the seats")
-    void paymentFailedCancelsTheTicket() throws Exception {
+    @DisplayName("payment_intent.payment_failed leaves Checkout retryable and keeps the seats")
+    void paymentFailedKeepsTicketPending() throws Exception {
         Show show = fixtures.createShow(fixtures.adminToken());
         TestUser user = fixtures.registerUser();
         long ticketId = pendingTicket(user.token(), show.scheduleId(), List.of(show.seat(5)));
@@ -168,9 +162,9 @@ class PaymentWebhookIntegrationTest extends AbstractTicketIntegrationTest {
         deliver(StripeEvents.paymentIntentFailed("evt_test_failed", "pi_test_failed", ticketId))
                 .andExpect(status().isOk());
 
-        assertThat(ticketStatus(ticketId)).isEqualTo("CANCELLED");
-        assertThat(reservationStatusesOfUser(user.id(), show.scheduleId())).containsExactly("RELEASED");
-        assertThat(fixtures.seatStatus(show.scheduleId(), show.seat(5))).isEqualTo("AVAILABLE");
+        assertThat(ticketStatus(ticketId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(reservationStatusesOfUser(user.id(), show.scheduleId())).containsExactly("HELD");
+        assertThat(fixtures.seatStatus(show.scheduleId(), show.seat(5))).isEqualTo("HELD");
     }
 
     @Test
@@ -190,8 +184,126 @@ class PaymentWebhookIntegrationTest extends AbstractTicketIntegrationTest {
 
         deliver(StripeEvents.chargeRefunded("evt_test_refunded", paymentIntentId, ticketId))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.result").value(org.hamcrest.Matchers.containsString("already REFUNDED")));
+                 .andExpect(jsonPath("$.result").value(org.hamcrest.Matchers.containsString("already recorded")));
         assertThat(ticketStatus(ticketId)).isEqualTo("REFUNDED");
+    }
+
+    @Test
+    @DisplayName("a checkout completed for the wrong amount is refunded, never marked PAID")
+    void amountMismatchIsRefunded() throws Exception {
+        Show show = fixtures.createShow(fixtures.adminToken());
+        TestUser user = fixtures.registerUser();
+        long ticketId = pendingTicket(user.token(), show.scheduleId(), List.of(show.seat(0)));
+        long expected = ticketTotalMinor(ticketId);
+        long paid = expected - 100; // one dollar short
+        String paymentIntentId = "pi_test_wrong_amount";
+
+        deliver(StripeEvents.checkoutSessionCompleted(
+                        "evt_test_wrong_amount", FakePaymentGateway.sessionIdOf(ticketId),
+                        ticketId, paymentIntentId, paid, ticketCurrency(ticketId)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.result").value(org.hamcrest.Matchers.containsString("refunded")));
+
+        assertThat(ticketStatus(ticketId)).isEqualTo("REFUNDED");
+        FakePaymentGateway.RecordedRefund refund = paymentGateway.refundOf(paymentIntentId).orElseThrow();
+        assertThat(refund.amount()).isEqualByComparingTo("24.00");
+        assertThat(reservationStatusesOfTicket(ticketId)).containsExactly("RELEASED");
+    }
+
+    @Test
+    @DisplayName("an event carrying another checkout session cannot pay the ticket")
+    void sessionMismatchIsIgnored() throws Exception {
+        Show firstShow = fixtures.createShow(fixtures.adminToken());
+        Show secondShow = fixtures.createShow(fixtures.adminToken());
+        TestUser user = fixtures.registerUser();
+        long ticketId = pendingTicket(user.token(), firstShow.scheduleId(), List.of(firstShow.seat(0)));
+        long otherTicketId = pendingTicket(user.token(), secondShow.scheduleId(), List.of(secondShow.seat(0)));
+
+        deliver(StripeEvents.checkoutSessionCompleted(
+                        "evt_test_session_mismatch", FakePaymentGateway.sessionIdOf(otherTicketId),
+                        ticketId, "pi_test_session_mismatch",
+                        ticketTotalMinor(ticketId), ticketCurrency(ticketId)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.result").value(org.hamcrest.Matchers.containsString("does not match")));
+
+        assertThat(ticketStatus(ticketId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(ticketStatus(otherTicketId)).isEqualTo("PENDING_PAYMENT");
+    }
+
+    @Test
+    @DisplayName("a partial refund leaves the ticket PAID; only a full refund releases it")
+    void partialRefundKeepsTicketPaid() throws Exception {
+        Show show = fixtures.createShow(fixtures.adminToken());
+        TestUser user = fixtures.registerUser();
+        long ticketId = pendingTicket(user.token(), show.scheduleId(), List.of(show.seat(0)));
+        String paymentIntentId = payTicket(ticketId);
+        long amount = ticketTotalMinor(ticketId);
+
+        deliver(StripeEvents.chargeRefunded(
+                        "evt_test_partial_refund", paymentIntentId, ticketId, amount, amount / 2))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.result").value(org.hamcrest.Matchers.containsString("partial")));
+
+        assertThat(ticketStatus(ticketId)).isEqualTo("PAID");
+        assertThat(reservationStatusesOfTicket(ticketId)).containsExactly("CONFIRMED");
+
+        deliver(StripeEvents.chargeRefunded(
+                        "evt_test_full_refund", paymentIntentId, ticketId, amount, amount))
+                .andExpect(status().isOk());
+
+        assertThat(ticketStatus(ticketId)).isEqualTo("REFUNDED");
+        assertThat(reservationStatusesOfTicket(ticketId)).containsExactly("RELEASED");
+    }
+
+    @Test
+    @DisplayName("checkout.session.async_payment_succeeded is treated like a completed payment")
+    void asyncPaymentSucceededPaysTicket() throws Exception {
+        Show show = fixtures.createShow(fixtures.adminToken());
+        TestUser user = fixtures.registerUser();
+        long ticketId = pendingTicket(user.token(), show.scheduleId(), List.of(show.seat(0)));
+        String payload = completedEvent(ticketId, "pi_test_async_success")
+                .replace(PaymentEvent.CHECKOUT_SESSION_COMPLETED,
+                        PaymentEvent.CHECKOUT_SESSION_ASYNC_PAYMENT_SUCCEEDED);
+
+        deliver(payload).andExpect(status().isOk());
+
+        assertThat(ticketStatus(ticketId)).isEqualTo("PAID");
+        assertThat(reservationStatusesOfTicket(ticketId)).containsExactly("CONFIRMED");
+    }
+
+    @Test
+    @DisplayName("a completed session that is still unpaid leaves the ticket PENDING_PAYMENT")
+    void unpaidCompletedSessionKeepsTicketPending() throws Exception {
+        Show show = fixtures.createShow(fixtures.adminToken());
+        TestUser user = fixtures.registerUser();
+        long ticketId = pendingTicket(user.token(), show.scheduleId(), List.of(show.seat(0)));
+        String payload = completedEvent(ticketId, "pi_test_unpaid")
+                .replace("\"payment_status\":\"paid\"", "\"payment_status\":\"unpaid\"");
+
+        deliver(payload)
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.result").value(org.hamcrest.Matchers.containsString("not completed")));
+
+        assertThat(ticketStatus(ticketId)).isEqualTo("PENDING_PAYMENT");
+        assertThat(reservationStatusesOfTicket(ticketId)).containsExactly("HELD");
+    }
+
+    @Test
+    @DisplayName("checkout.session.async_payment_failed releases the seats")
+    void asyncPaymentFailedReleasesSeats() throws Exception {
+        Show show = fixtures.createShow(fixtures.adminToken());
+        TestUser user = fixtures.registerUser();
+        long ticketId = pendingTicket(user.token(), show.scheduleId(), List.of(show.seat(0)));
+        String payload = completedEvent(ticketId, "pi_test_async_failed")
+                .replace(PaymentEvent.CHECKOUT_SESSION_COMPLETED,
+                        PaymentEvent.CHECKOUT_SESSION_ASYNC_PAYMENT_FAILED);
+
+        deliver(payload)
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.result").value(org.hamcrest.Matchers.containsString("CANCELLED")));
+
+        assertThat(ticketStatus(ticketId)).isEqualTo("CANCELLED");
+        assertThat(reservationStatusesOfTicket(ticketId)).containsExactly("RELEASED");
     }
 
     @Test
@@ -212,14 +324,14 @@ class PaymentWebhookIntegrationTest extends AbstractTicketIntegrationTest {
         fixtures.holdSeats(other.token(), show.scheduleId(), List.of(seatId));
 
         String paymentIntentId = "pi_test_orphaned_payment";
-        deliver(StripeEvents.checkoutSessionCompleted("evt_test_orphaned_seats",
-                        FakePaymentGateway.sessionIdOf(ticketId), ticketId, paymentIntentId))
+        deliver(completedEvent(ticketId, paymentIntentId))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.result").value(org.hamcrest.Matchers.containsString("refunded")));
 
         // The buyer is not charged for seats that are not theirs: REFUNDED, never PAID.
         assertThat(ticketStatus(ticketId)).isEqualTo("REFUNDED");
-        assertThat(ticketIsPaidAtSet(ticketId)).isFalse();
+        // The captured payment belongs in gross revenue even though it was refunded immediately.
+        assertThat(ticketIsPaidAtSet(ticketId)).isTrue();
         FakePaymentGateway.RecordedRefund refund = paymentGateway.refundOf(paymentIntentId).orElseThrow();
         assertThat(refund.amount()).isEqualByComparingTo(new BigDecimal("10.00"));
 
@@ -239,8 +351,7 @@ class PaymentWebhookIntegrationTest extends AbstractTicketIntegrationTest {
                         + "WHERE user_id = ? AND schedule_id = ? AND status = 'HELD'",
                 buyer.id(), show.scheduleId());
 
-        deliver(StripeEvents.checkoutSessionCompletedWithoutPaymentIntent(
-                        "evt_test_orphaned_no_pi", FakePaymentGateway.sessionIdOf(ticketId), ticketId))
+        deliver(completedEventWithoutPaymentIntent(ticketId))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.result").value(org.hamcrest.Matchers.containsString("manual-follow-up")));
 

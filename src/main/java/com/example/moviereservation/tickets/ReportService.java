@@ -36,17 +36,9 @@ import java.util.stream.Stream;
  * the unfiltered ticket list. Nothing here ever writes a row.
  *
  * <h2>The revenue definition (one place, used by every number below)</h2>
- * Revenue is the sum of {@code tickets.total_price} over the tickets whose status is
- * {@link TicketStatus#PAID} and whose {@code paid_at} lies in {@code [from, to)} — money that
- * actually arrived inside the window, measured at the instant it arrived rather than at the instant
- * the showtime plays.
- *
- * <p>A refund flips the ticket to {@link TicketStatus#REFUNDED}, so it drops out of that sum by
- * itself; refunds are reported next to it ({@code refundedTickets}, {@code refundedAmount}) using
- * the same {@code paid_at} window, and {@code netRevenue} is therefore equal to
- * {@code grossRevenue} — see {@link RevenueReportDto} for why subtracting refunds again would be
- * double counting. {@code PENDING_PAYMENT}, {@code CANCELLED} and {@code EXPIRED} tickets carry no
- * money and are ignored everywhere.
+ * Gross is the sum of captured ticket amounts by {@code paid_at}, regardless of their later
+ * status. Refunds come from the refund ledger by their own processing timestamp; net is gross
+ * minus refunds. A refund of an older sale can therefore make a window's net negative.
  *
  * <p>All money is {@link BigDecimal} at scale 2, like the {@code NUMERIC(10,2)} columns it comes
  * from; percentages are scale 2 as well.
@@ -70,6 +62,7 @@ public class ReportService {
     public static final int DEFAULT_WINDOW_DAYS = 30;
 
     private final TicketRepository ticketRepository;
+    private final TicketRefundRepository refundRepository;
     private final TicketService ticketService;
     private final SeatReservationService seatReservationService;
     private final ScheduleService scheduleService;
@@ -78,12 +71,14 @@ public class ReportService {
     private final String currency;
 
     public ReportService(TicketRepository ticketRepository,
+                         TicketRefundRepository refundRepository,
                          TicketService ticketService,
                          SeatReservationService seatReservationService,
                          ScheduleService scheduleService,
                          TheaterService theaterService,
                          @Value("${app.stripe.currency}") String currency) {
         this.ticketRepository = ticketRepository;
+        this.refundRepository = refundRepository;
         this.ticketService = ticketService;
         this.seatReservationService = seatReservationService;
         this.scheduleService = scheduleService;
@@ -114,23 +109,25 @@ public class ReportService {
                     "from (%s) must not be after to (%s)".formatted(format(windowStart), format(windowEnd)));
         }
 
-        RevenueTotals paid = ticketRepository.totalsForStatusInPaidWindow(
-                TicketStatus.PAID, windowStart, windowEnd);
-        RevenueTotals refunded = ticketRepository.totalsForStatusInPaidWindow(
-                TicketStatus.REFUNDED, windowStart, windowEnd);
+        List<String> currencies = ticketRepository.currenciesInReportWindow(windowStart, windowEnd);
+        if (currencies.size() > 1) {
+            throw new BadRequestException("Cannot combine payments in different currencies in one revenue report");
+        }
+
+        RevenueTotals paid = ticketRepository.totalsInPaidWindow(windowStart, windowEnd);
+        RevenueTotals refunded = refundRepository.totalsInWindow(windowStart, windowEnd);
         BigDecimal gross = money(paid.amountOrZero());
+        BigDecimal refunds = money(refunded.amountOrZero());
 
         return new RevenueReportDto(
                 windowStart,
                 windowEnd,
-                currency,
+                currencies.isEmpty() ? currency : currencies.get(0),
                 paid.ticketCount(),
                 gross,
                 refunded.ticketCount(),
-                money(refunded.amountOrZero()),
-                // netRevenue == grossRevenue: refunded tickets are not PAID anymore, so they were
-                // never part of `gross` and must not be subtracted a second time.
-                gross,
+                refunds,
+                gross.subtract(refunds),
                 revenueByMovie(windowStart, windowEnd),
                 revenueByDay(windowStart, windowEnd));
     }
@@ -145,8 +142,7 @@ public class ReportService {
         Map<Long, long[]> counts = new LinkedHashMap<>();
         Map<Long, BigDecimal> amounts = new LinkedHashMap<>();
 
-        for (ScheduleRevenueRow row : ticketRepository.revenueByScheduleInPaidWindow(
-                TicketStatus.PAID, from, to)) {
+        for (ScheduleRevenueRow row : ticketRepository.revenueByScheduleInPaidWindow(from, to)) {
             ScheduleDto schedule;
             try {
                 schedule = scheduleService.getScheduleById(row.scheduleId());
@@ -173,8 +169,7 @@ public class ReportService {
      */
     private List<DailyRevenueDto> revenueByDay(OffsetDateTime from, OffsetDateTime to) {
         ZoneId zone = scheduleService.getZone();
-        return ticketRepository.revenueByDayInPaidWindow(
-                        TicketStatus.PAID.name(), zone.getId(), from, to).stream()
+        return ticketRepository.revenueByDayInPaidWindow(zone.getId(), from, to).stream()
                 .map(row -> new DailyRevenueDto(toLocalDate(row[0]), toLong(row[1]), money(toBigDecimal(row[2]))))
                 .toList();
     }
@@ -237,9 +232,7 @@ public class ReportService {
                 Sort.by(Sort.Order.desc("id")));
 
         Page<Ticket> tickets = ticketRepository.findAll(filterSpecification(parsedStatus, scheduleId, userId), pageable);
-        List<TicketDto> content = tickets.getContent().stream()
-                .map(ticketService::toDto)
-                .toList();
+        List<TicketDto> content = ticketService.toDtos(tickets.getContent());
         return PageResponse.of(tickets, content);
     }
 
