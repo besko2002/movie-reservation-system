@@ -336,12 +336,12 @@ Two layers, and the decisive one is in the database:
    never blocks a later booking of the same seat, while two concurrent attempts to hold seat *S* of
    showtime *X* can never both exist.
 
-2. **One transaction per hold request.** The hold runs inside a single transaction that first checks
-   the seat map and then inserts the reservations; if a concurrent transaction wins the race, the
-   index raises a constraint violation, which the service translates into `409 Conflict` and the
-   whole request is rolled back — no partial hold is ever left behind. Nothing relies on
-   application-level locking or on read-then-write timing, which is why the concurrency test can
-   fire parallel requests at the same seat and still see exactly one winner.
+2. **One transaction per hold request.** The hold runs inside a single transaction that checks
+   the requested seats and inserts their reservations; if another request wins the same-seat race,
+   the index raises a constraint violation, translated into `409 Conflict`, and the whole hold
+   rolls back. A transaction-scoped PostgreSQL advisory lock on (user, schedule) also serializes
+   the active-seat count before inserting, so parallel requests for different seats cannot exceed
+   the per-user seat limit. Concurrency tests cover both cases.
 
 ## Stripe setup (test mode)
 
@@ -374,7 +374,7 @@ and the endpoints that need a provider answer `503` instead of failing with a `5
 JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw clean verify
 ```
 
-199 tests: unit tests plus `@SpringBootTest` slices that start a **real PostgreSQL 16 via
+Unit tests plus `@SpringBootTest` integration tests that start a **real PostgreSQL 16 via
 Testcontainers** — Docker must be running. No test ever calls Stripe over the network: every payment
 goes through the `PaymentGateway` port, which is stubbed in tests. The suite covers the late-payment
 refund, concurrent checkout, unpaid and async payment events, amount and session mismatches, partial

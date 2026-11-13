@@ -211,6 +211,13 @@ public class SeatReservationService {
             throw new ConflictException(takenMessage(scheduleId, taken, seatsOfTheater));
         }
 
+        // Serialise concurrent hold requests from the SAME user for the SAME schedule, so the
+        // active-seat count below cannot go stale between the SELECT and the INSERT. Without this
+        // advisory lock two parallel requests for disjoint seats would both read the same count,
+        // both pass the check, and together exceed maxSeatsPerUser. The lock is released
+        // automatically when the transaction commits or rolls back.
+        reservationRepository.lockUserSchedule(userId, scheduleId);
+
         // The per-request limit above stops one huge request; this stops the same user from
         // accumulating the whole hall through many small ones. Confirmed seats count too: they are
         // still the same buyer occupying the same showtime.

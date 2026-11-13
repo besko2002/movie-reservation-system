@@ -102,6 +102,21 @@ interface SeatReservationRepository extends JpaRepository<SeatReservation, Long>
                             @Param("now") OffsetDateTime now);
 
     /**
+     * Acquires a PostgreSQL transaction-scoped advisory lock keyed on (userId, scheduleId). Two
+     * concurrent hold requests from the <em>same</em> user for the <em>same</em> schedule will
+     * serialise here, so the active-seat count that follows cannot be stale. The lock is released
+     * automatically when the transaction commits or rolls back.
+     *
+     * <p>The key space is shared with all advisory locks of this database, so the constants use the
+     * table OID convention: {@code userId} in the first slot and {@code scheduleId} in the second.
+     * Both are narrowed to {@code int} (the PostgreSQL signature), which is safe because the
+     * identity columns will not reach 2³¹ in any practical deployment.
+     */
+    @Query(value = "SELECT pg_advisory_xact_lock(CAST(:userId AS int), CAST(:scheduleId AS int))",
+            nativeQuery = true)
+    void lockUserSchedule(@Param("userId") Long userId, @Param("scheduleId") Long scheduleId);
+
+    /**
      * Same as {@link #releaseExpiredHolds} but limited to the seats a hold request is about. It runs
      * inside the hold transaction, because the partial unique index does not know about expiry: an
      * expired HELD row would otherwise block the re-booking of its seat.
